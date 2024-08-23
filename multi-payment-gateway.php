@@ -21,54 +21,54 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
             ->setLabel(___("Payment System URL\n" .
                 'This is the payment URL of multi-payment-gateway. (Example: http://example.com/multi-payment-gateway/)'))
             ->addRule('required');
-        $form->addText('encryption_key', array('size' => 100))
-            ->setLabel("Encryption Key")
+        $form->addText('site_secret', array('size' => 100))
+            ->setLabel("Site Secret")
             ->addRule('required');
     }
 
     public function _process($invoice, $request, $result)
     {
-        $payment_session_url = rtrim($this->getConfig('payment_url'), '/') . '/' . 'create-payment-session.php';
+        $payment_session_url = rtrim($this->getConfig('payment_url'), '/') . '/api/v1/sessions/create';
         $request = new Am_HttpRequest($payment_session_url, Am_HttpRequest::METHOD_POST);
         $hashData = array(
-            'amount' => $invoice->first_total,
+            'amount' => intval($invoice->first_total * 100), // Convert to cents
             'currency' => $invoice->currency,
             'email' => $invoice->getEmail(),
-            'custominvoiceid' => $invoice->public_id,
-            'returnurl' => $this->getPluginUrl('thanks'),
-            'cancelurl' => $this->getCancelUrl(),
-            'ipnurl' => $this->getPluginUrl('ipn'),
+            'customInvoiceId' => $invoice->public_id,
+            //'returnUrl' => $this->getPluginUrl('thanks') . '?customInvoiceId=' . urlencode($invoice->public_id),
+            'returnUrl' => $this->getReturnUrl(),
+            'cancelUrl' => $this->getCancelUrl(),
+            'ipnUrl' => $this->getPluginUrl('ipn'),
         );
 
-        ksort($hashData);
+        // Set the request headers
+        $request->setHeader('Content-Type', 'application/json');
+        $request->setHeader('Site-Secret', $this->getConfig('site_secret'));
 
-        $hashString = implode('', $hashData);
-        $computedHash = hash_hmac('sha256', $hashString, $this->getConfig('encryption_key'));
-        $hashData['hash'] = $computedHash;
+        // Set the request body as JSON
+        $request->setBody(json_encode($hashData));
 
-        $request->addPostParameter($hashData);
         $log = $this->logRequest($request);
         $response = $request->send();
         $log->add($response);
 
         if ($response->getStatus() == 406) {
-            $responseBody = json_decode($response->getBody(), true);
-            $errorMessage = isset($responseBody['error']) ? $responseBody['error'] : 'Unknown error';
-            $result->setFailed('Payment session creation failed. Reason: ' . $errorMessage);
-            return;
-        }
-
-        if ($response->getStatus() != 201) {
+            $errorBody = json_decode($response->getBody(), true);
+            if (isset($errorBody['error'])) {
+                throw new Am_Exception_FatalError($errorBody['error']);
+            }
+            throw new Am_Exception_FatalError($response->getBody());
+        } else if ($response->getStatus() != 200) {
             throw new Am_Exception_InternalError("Can't create payment session. Got:" . $response->getBody());
         }
 
         $r = json_decode($response->getBody(), true);
-        if (!isset($r['sid'])) {
+        if (!isset($r['paymentUrl'])) {
             $result->setFailed('Payment session creation failed. Reason: ' . $r['error']);
             return;
         }
 
-        $payment_url = rtrim($this->getConfig('payment_url'), '/') . '/' . 'index.php?sid=' . $r['sid'];
+        $payment_url = $r['paymentUrl'];
         $a = new Am_Paysystem_Action_Redirect($payment_url);
         $result->setAction($a);
     }
@@ -85,7 +85,7 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
     <b>aMember Multi Payment Gateway plugin setup</b>
 
     - Enter URL of Multi Payment Gateway in "Payment System URL".
-    - Get your Encryption Key (app_secret) from your Multi Payment Gateway and enter it in "Encryption Key".
+    - Get your Site Secret from your Multi Payment Gateway and enter it in "Site Secret".
 CUT;
     }
 
@@ -98,25 +98,23 @@ CUT;
     {
         return new Am_Paysystem_Transaction_MultiPaymentGateway($this, $request, $response, $invokeArgs);
     }
-
 }
 
 class Am_Paysystem_Transaction_MultiPaymentGateway_Thanks extends Am_Paysystem_Transaction_Incoming_Thanks
 {
     public function findInvoiceId()
     {
-        return $this->request->get('custominvoiceid');
+        return $this->request->getFiltered('customInvoiceId');
     }
 
     public function getUniqId()
     {
-        return $this->request->get('transactionid');
+        return true;
     }
 
     public function validateStatus()
     {
-        $status = $this->request->get('status');
-        return in_array($status, ['0', '1', '2', '4']);
+        return true;
     }
 
     public function validateTerms()
@@ -126,110 +124,82 @@ class Am_Paysystem_Transaction_MultiPaymentGateway_Thanks extends Am_Paysystem_T
 
     public function validateSource()
     {
-        $hashData = array(
-            'status' => $this->request->get('status'),
-            'transactionid' => $this->request->get('transactionid'),
-            'custominvoiceid' => $this->request->get('custominvoiceid'),
-        );
-
-        ksort($hashData);
-        $hashString = implode('', $hashData);
-        $computedHash = hash_hmac('sha256', $hashString, $this->getPlugin()->getConfig('encryption_key'));
-
-        return hash_equals($computedHash, $this->request->get('hash'));
-    }
-
-    public function getInvoice()
-    {
-        return $this->invoice;
+        return true;
     }
 
     public function processValidated()
     {
-        switch ($this->request->get('status')) {
-            case "0": // pending
-                $v = new Am_View;
-                $v->title = ___("Payment Pending / Zahlung ausstehend / Paiement en attente / Betaling in behandeling / Pagamento in sospeso / Pago pendiente / 待付款");
-                $v->content = sprintf("<p>%s</p>", ___('English: <br>Although your payment has been processed, the result is still pending. Usually, this process is completed within 3 days. We will send you an email once the money has been credited to our account. No further payment is required for this order.<br><br>
-                                                                Deutsch: <br>Obwohl Deine Zahlung bereits verarbeitet wurde, steht das Ergebnis noch aus. Normalerweise ist dieser Vorgang innerhalb von 3 Tagen abgeschlossen. Wir senden Dir eine E-Mail, sobald das Geld auf unserem Konto gutgeschrieben wurde. Für diese Bestellung ist keine weitere Zahlung erforderlich.<br><br>
-                                                                Français: <br>Bien que votre paiement ait été traité, le résultat est toujours en attente. En général, ce processus est complété en 3 jours. Nous vous enverrons un email dès que l\'argent sera crédité sur notre compte. Aucun paiement supplémentaire n\'est nécessaire pour cette commande.<br><br>
-                                                                Nederlands: <br>Hoewel uw betaling is verwerkt, is het resultaat nog steeds in behandeling. Meestal is dit proces binnen 3 dagen voltooid. We sturen u een e-mail zodra het geld op onze rekening is bijgeschreven. Voor deze bestelling is geen verdere betaling nodig.<br><br>
-                                                                Italiano: <br>Sebbene il pagamento sia stato elaborato, il risultato è ancora in sospeso. Di solito questo processo si completa entro 3 giorni. Ti invieremo un\'email una volta che il denaro sarà stato accreditato sul nostro conto. Non è necessario alcun ulteriore pagamento per questo ordine.<br><br>
-                                                                Español: <br>Sebbene il pagamento sia stato elaborato, il risultato è ancora in sospeso. Di solito questo processo si completa entro 3 giorni. Ti invieremo un\'email una volta che il denaro sarà stato accreditato sul nostro conto. Non è necessario alcun ulteriore pagamento per questo ordine.<br><br>
-                                                                中文: <br>虽然您的付款已经处理,但结果仍在等待。通常这个过程在3天内完成。款项存入我们的账户后,我们会给您发送一封电子邮件。此订单无需额外付款。<br><br>'));
-                $v->display('layout.phtml');
-                throw new Am_Exception_Redirect;
-                break;
-            case '1': // paid
-                if ($this->invoice->status != Invoice::PAID) {
-                    $this->invoice->addPayment($this);
-                }
-                break;
-            case '2': // failed
-                if ($this->invoice->status == Invoice::PAID) {
-                    $this->invoice->addVoid($this, $this->getUniqId());
-                }
-                break;
-            case '3': // refund
-                if ($this->invoice->status == Invoice::PAID) {
-                    $this->invoice->addRefund($this, $this->getUniqId());
-                }
-                break;
-            case '4': // chargeback
-                $this->invoice->setCancelled(true);
-                $this->invoice->addChargeback($this, $this->getUniqId());
-                break;
-            default:
-                // Do nothing for withdrawn, retried
-                break;
-        }
+        return true;
     }
 }
 
 class Am_Paysystem_Transaction_MultiPaymentGateway extends Am_Paysystem_Transaction_Incoming
 {
+    protected $parsedRequest;
+
     public function validateSource()
     {
+
+        $this->parsedRequest = json_decode($this->request->getRawBody(), true);
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($this->parsedRequest)) {
+            // Log the JSON error for debugging
+            error_log("JSON Error: " . json_last_error_msg());
+            error_log("Raw Request Body: " . $this->request->getRawBody());
+            throw new Am_Exception_Paysystem("Invalid JSON in request body");
+        }
+
+        if (!isset($this->parsedRequest['status'], $this->parsedRequest['transactionId'], $this->parsedRequest['customInvoiceId'])) {
+            throw new Am_Exception_Paysystem("Missing required fields in response");
+        }
+
         $hashData = array(
-            'status' => $this->request->get('status'),
-            'transactionid' => $this->request->get('transactionid'),
-            'custominvoiceid' => $this->request->get('custominvoiceid'),
+            'status' => $this->parsedRequest['status'],
+            'transactionId' => $this->parsedRequest['transactionId'],
+            'customInvoiceId' => $this->parsedRequest['customInvoiceId'],
         );
 
         ksort($hashData);
-        $hashString = implode('', $hashData);
-        $computedHash = hash_hmac('sha256', $hashString, $this->getPlugin()->getConfig('encryption_key'));
+        $hashString = json_encode($hashData);
+        $computedHash = hash_hmac('sha256', $hashString, $this->getPlugin()->getConfig('site_secret'));
 
-        return hash_equals($computedHash, $this->request->get('hash'));
+        // Retrieve the hash from the X-Signature header
+        $receivedHash = $this->request->getHeader('X-Signature');
+        if (is_null($receivedHash)) {
+            // Log or handle the missing hash case
+            throw new Am_Exception_Paysystem("X-Signature header is missing");
+        }
+
+        return hash_equals($computedHash, $receivedHash);
     }
 
-    public function validateStatus()
-    {
-        $status = $this->request->get('status');
-        return in_array($status, ['0', '1', '2', '4']);
-    }
-
-    public function findInvoiceId()
-    {
-        return $this->request->get('custominvoiceid');
-    }
-
-    public function getUniqId()
-    {
-        return $this->request->get('transactionid');
-    }
     public function validateTerms()
     {
         return true;
     }
 
+    public function validateStatus()
+    {
+        $status = $this->parsedRequest['status'];
+        return in_array($status, ['0', '1', '2', '4']);
+    }
+
+    public function findInvoiceId()
+    {
+        return $this->parsedRequest['customInvoiceId'];
+    }
+
+    public function getUniqId()
+    {
+        return $this->parsedRequest['transactionId'];
+    }
+
     public function processValidated()
     {
-        switch ($this->request->get('status')) {
+        switch ($this->parsedRequest['status']) {
             case "0": // pending
                 // do nothing
                 break;
-            case '1': // paid
+            case '1': // successful
                 if ($this->invoice->status != Invoice::PAID) {
                     $this->invoice->addPayment($this);
                 }
@@ -239,20 +209,16 @@ class Am_Paysystem_Transaction_MultiPaymentGateway extends Am_Paysystem_Transact
                     $this->invoice->addVoid($this, $this->getUniqId());
                 }
                 break;
-            case '3': // refund
-                if ($this->invoice->status == Invoice::PAID) {
-                    $this->invoice->addRefund($this, $this->getUniqId());
-                }
-                break;
             case '4': // chargeback
                 $this->invoice->setCancelled(true);
                 $this->invoice->addChargeback($this, $this->getUniqId());
                 break;
             default:
-                // Do nothing for withdrawn, retried
+                // Do nothing for other statuses
                 break;
         }
+        // Send HTTP 200 response with "OK" body
+        echo "OK";
         http_response_code(200);
     }
-
 }
