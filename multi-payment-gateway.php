@@ -18,7 +18,7 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
     public function _initSetupForm(Am_Form_Setup $form)
     {
         $form->addText('mpg_main_backend_domain')
-            ->setLabel(___("Default Multi Payment Gateway Main Backend Domain\n" .
+            ->setLabel(___("Default Main Backend Domain\n" .
                 'Enter the main backend domain for your Multi Payment Gateway site configuration without the protocol. For example, use "example.com" instead of "https://example.com".'))
             ->addRule('required');
         $form->addText('site_secret', array('size' => 100))
@@ -84,7 +84,7 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
         return <<<CUT
     <b>aMember Multi Payment Gateway plugin setup</b>
 
-    - Enter the main backend domain for your Multi Payment Gateway configuration in "Default Multi Payment Gateway Main Backend Domain".
+    - Enter the main backend domain for your Multi Payment Gateway configuration in "Default Main Backend Domain".
     - Get your Site Secret from your Multi Payment Gateway and enter it in "Site Secret".
 CUT;
     }

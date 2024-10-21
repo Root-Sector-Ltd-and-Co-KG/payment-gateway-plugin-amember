@@ -7,6 +7,7 @@ Use this plugin within aMember to use Multi Payment Gateway as payment method.
 - [aMember](https://www.amember.com/)
 
 ## Installation
+
 1. Copy directory "multi-payment-gateway.php" into "../amember/application/default/plugins/payment" of your aMember installation.
 2. Enable "multi-payment-gateway" Add-on on https://<url>/amember/admin-plugins
-3. Add your "Default Multi Payment Gateway Main Backend Domain" and "Site Secret" on https://<url>/amember/admin-setup/multi-payment-gateway
+3. Add your "Default Main Backend Domain" and "Site Secret" on https://<url>/amember/admin-setup/multi-payment-gateway
