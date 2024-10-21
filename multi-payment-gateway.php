@@ -17,9 +17,9 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
 
     public function _initSetupForm(Am_Form_Setup $form)
     {
-        $form->addText('payment_url')
-            ->setLabel(___("Payment System URL\n" .
-                'This is the payment URL of multi-payment-gateway. (Example: http://example.com/multi-payment-gateway/)'))
+        $form->addText('mpg_main_backend_domain')
+            ->setLabel(___("Default Multi Payment Gateway Main Backend Domain\n" .
+                'Enter the main backend domain for your Multi Payment Gateway site configuration without the protocol. For example, use "example.com" instead of "https://example.com".'))
             ->addRule('required');
         $form->addText('site_secret', array('size' => 100))
             ->setLabel("Site Secret")
@@ -28,8 +28,8 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
 
     public function _process($invoice, $request, $result)
     {
-        $payment_session_url = rtrim($this->getConfig('payment_url'), '/') . '/api/v1/sessions/create';
-        $request = new Am_HttpRequest($payment_session_url, Am_HttpRequest::METHOD_POST);
+        $paymentSessionUrl = 'https://' . rtrim($this->getConfig('mpg_main_backend_domain'), '/') . 'api/v1/sessions/create';
+        $request = new Am_HttpRequest($paymentSessionUrl, Am_HttpRequest::METHOD_POST);
         $hashData = array(
             'amount' => intval($invoice->first_total * 100), // Convert to cents
             'currency' => $invoice->currency,
@@ -84,7 +84,7 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
         return <<<CUT
     <b>aMember Multi Payment Gateway plugin setup</b>
 
-    - Enter URL of Multi Payment Gateway in "Payment System URL".
+    - Enter the main backend domain for your Multi Payment Gateway configuration in "Default Multi Payment Gateway Main Backend Domain".
     - Get your Site Secret from your Multi Payment Gateway and enter it in "Site Secret".
 CUT;
     }
