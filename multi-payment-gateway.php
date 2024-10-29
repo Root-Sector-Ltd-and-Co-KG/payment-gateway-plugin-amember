@@ -28,10 +28,11 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
 
     public function _process($invoice, $request, $result)
     {
-        $paymentSessionUrl = 'https://' . rtrim($this->getConfig('mpg_main_backend_domain'), '/') . 'api/v1/sessions/create';
+        $paymentSessionUrl = 'https://' . rtrim($this->getConfig('mpg_main_backend_domain'), '/') . '/api/v1/sessions/create';
         $request = new Am_HttpRequest($paymentSessionUrl, Am_HttpRequest::METHOD_POST);
+        $amount = round($invoice->first_total * 100); // Convert to cents
         $hashData = array(
-            'amount' => intval($invoice->first_total * 100), // Convert to cents
+            'amount' => $amount,
             'currency' => $invoice->currency,
             'email' => $invoice->getEmail(),
             'customInvoiceId' => $invoice->public_id,
