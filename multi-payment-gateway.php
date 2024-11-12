@@ -19,10 +19,11 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
     {
         $form->addText('mpg_main_backend_domain')
             ->setLabel(___("Default Main Backend Domain\n" .
-                'Enter the main backend domain for your Multi Payment Gateway site configuration without the protocol. For example, use "example.com" instead of "https://example.com".'))
+                'Your Multi Payment Gateway main backend domain without the protocol. For example, use "example.com" instead of "https://example.com".'))
             ->addRule('required');
-        $form->addText('site_secret', array('size' => 100))
-            ->setLabel("Site Secret")
+        $form->addText('site_secret_key', array('size' => 100))
+            ->setLabel(___("Site Secret Key\n" .
+                'Your Multi Payment Gateway site secret key.'))
             ->addRule('required');
     }
 
@@ -44,7 +45,7 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
 
         // Set the request headers
         $request->setHeader('Content-Type', 'application/json');
-        $request->setHeader('Site-Secret', $this->getConfig('site_secret'));
+        $request->setHeader('Site-Secret-Key', $this->getConfig('site_secret_key'));
 
         // Set the request body as JSON
         $request->setBody(json_encode($hashData));
@@ -161,7 +162,7 @@ class Am_Paysystem_Transaction_MultiPaymentGateway extends Am_Paysystem_Transact
 
         ksort($hashData);
         $hashString = json_encode($hashData);
-        $computedHash = hash_hmac('sha256', $hashString, $this->getPlugin()->getConfig('site_secret'));
+        $computedHash = hash_hmac('sha256', $hashString, $this->getPlugin()->getConfig('site_secret_key'));
 
         // Retrieve the hash from the X-Signature header
         $receivedHash = $this->request->getHeader('X-Signature');
