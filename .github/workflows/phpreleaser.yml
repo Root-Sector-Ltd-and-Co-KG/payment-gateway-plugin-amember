@@ -29,5 +29,4 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           artifacts: multi-payment-gateway_v${{ github.ref_name }}.zip
-          bodyFile: "multi-payment-gateway/RELEASE.md"
           token: ${{ secrets.GITHUB_TOKEN }}
