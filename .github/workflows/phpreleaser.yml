@@ -1,0 +1,33 @@
+name: phpreleaser
+
+on:
+  pull_request:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  phpreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Print Release Version
+        run: echo Release version is ${{ github.ref_name }}
+
+      - name: Create Subfolder
+        run: mkdir -p multi-payment-gateway && find . -maxdepth 1 -type f -exec mv {} multi-payment-gateway/ \; && find . -maxdepth 1 -type d ! -name multi-payment-gateway ! -name . -exec mv {} multi-payment-gateway/ \; && rm -rf multi-payment-gateway/.git* multi-payment-gateway/.github
+
+      - name: Archive Release
+        uses: thedoctor0/zip-release@0.7.6
+        with:
+          type: "zip"
+          filename: multi-payment-gateway_v${{ github.ref_name }}.zip
+          exclusions: "multi-payment-gateway/RELEASE.md *.git* *.github*"
+
+      - name: Upload Release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: multi-payment-gateway_v${{ github.ref_name }}.zip
+          bodyFile: "multi-payment-gateway/RELEASE.md"
+          token: ${{ secrets.GITHUB_TOKEN }}
