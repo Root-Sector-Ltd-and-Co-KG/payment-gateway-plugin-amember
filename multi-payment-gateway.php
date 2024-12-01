@@ -182,7 +182,7 @@ class Am_Paysystem_Transaction_MultiPaymentGateway extends Am_Paysystem_Transact
     public function validateStatus()
     {
         $status = $this->parsedRequest['status'];
-        return in_array($status, ['0', '1', '2', '4']);
+        return in_array($status, ['0', '1', '2', '3', '4']);
     }
 
     public function findInvoiceId()
@@ -209,6 +209,11 @@ class Am_Paysystem_Transaction_MultiPaymentGateway extends Am_Paysystem_Transact
             case '2': // failed
                 if ($this->invoice->status == Invoice::PAID) {
                     $this->invoice->addVoid($this, $this->getUniqId());
+                }
+                break;
+            case '3': // refunded
+                if ($this->invoice->status == Invoice::PAID) {
+                    $this->invoice->addRefund($this, $this->getUniqId());
                 }
                 break;
             case '4': // chargeback
