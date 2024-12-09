@@ -217,7 +217,6 @@ class Am_Paysystem_Transaction_MultiPaymentGateway extends Am_Paysystem_Transact
                 }
                 break;
             case '4': // chargeback
-                $this->invoice->setCancelled(true);
                 $this->invoice->addChargeback($this, $this->getUniqId());
                 break;
             default:
