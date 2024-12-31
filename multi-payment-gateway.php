@@ -25,6 +25,13 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
             ->setLabel(___("Site Secret Key\n" .
                 'Your Multi Payment Gateway site secret key.'))
             ->addRule('required');
+
+        $form->addAdvCheckbox('pass_billing_address')
+            ->setLabel(___("Pass Billing Address\n" .
+                'Enable passing billing address.'));
+        $form->addAdvCheckbox('pass_items')
+            ->setLabel(___("Pass Items\n" .
+                'Enable passing items.'));
     }
 
     public function _process($invoice, $request, $result)
@@ -42,6 +49,32 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
             'cancelUrl' => $this->getCancelUrl(),
             'ipnUrl' => $this->getPluginUrl('ipn'),
         );
+
+        // Conditionally add billing and shipping fields
+        if ($this->getConfig('pass_billing_address')) {
+            $hashData['billingAddress'] = array(
+                'firstName' => $invoice->getFirstName(),
+                'lastName' => $invoice->getLastName(),
+                'address1' => $invoice->getStreet(),
+                'city' => $invoice->getCity(),
+                'postcode' => $invoice->getZip(),
+                'country' => $invoice->getCountry(),
+            );
+        }
+
+        // Conditionally pass items as virtual
+        if ($this->getConfig('pass_items')) {
+            $items = array();
+            foreach ($invoice->getItems() as $item) {
+                $items[] = array(
+                    'name' => $item->item_title,
+                    'quantity' => $item->qty,
+                    'amount' => round($item->first_total * 100),
+                    'type' => 'virtual',
+                );
+            }
+            $hashData['items'] = $items;
+        }
 
         // Set the request headers
         $request->setHeader('Content-Type', 'application/json');
