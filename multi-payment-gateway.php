@@ -21,6 +21,10 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
             ->setLabel(___("Default Main Backend Domain\n" .
                 'Your Multi Payment Gateway main backend domain without the protocol. For example, use "example.com" instead of "https://example.com".'))
             ->addRule('required');
+        $form->addText('site_id')
+            ->setLabel(___("Site ID\n" .
+                'Your Multi Payment Gateway site ID.'))
+            ->addRule('required');
         $form->addText('site_secret_key', array('size' => 100))
             ->setLabel(___("Site Secret Key\n" .
                 'Your Multi Payment Gateway site secret key.'))
@@ -78,6 +82,7 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
 
         // Set the request headers
         $request->setHeader('Content-Type', 'application/json');
+        $request->setHeader('Site-Id', $this->getConfig('site_id'));
         $request->setHeader('Site-Secret-Key', $this->getConfig('site_secret_key'));
 
         // Set the request body as JSON
@@ -174,37 +179,44 @@ class Am_Paysystem_Transaction_MultiPaymentGateway extends Am_Paysystem_Transact
 
     public function validateSource()
     {
+        $raw_body = $this->request->getRawBody();
+        $this->parsedRequest = json_decode($raw_body, true);
 
-        $this->parsedRequest = json_decode($this->request->getRawBody(), true);
         if (json_last_error() !== JSON_ERROR_NONE || !is_array($this->parsedRequest)) {
-            // Log the JSON error for debugging
-            error_log("JSON Error: " . json_last_error_msg());
-            error_log("Raw Request Body: " . $this->request->getRawBody());
+            $this->getPlugin()->logError("IPN: Invalid JSON received.", $raw_body);
             throw new Am_Exception_Paysystem("Invalid JSON in request body");
         }
 
-        if (!isset($this->parsedRequest['status'], $this->parsedRequest['transactionId'], $this->parsedRequest['customInvoiceId'])) {
-            throw new Am_Exception_Paysystem("Missing required fields in response");
+        // --- New Webhook Verification Logic ---
+        $received_timestamp = $this->request->getHeader('X-Signature-Timestamp');
+        $received_signature = $this->request->getHeader('X-Signature-HMAC-SHA256');
+
+        if (!$received_timestamp || !$received_signature) {
+            $this->getPlugin()->logError("IPN: Signature headers missing.");
+            throw new Am_Exception_Paysystem("Signature headers missing");
         }
 
-        $hashData = array(
-            'status' => $this->parsedRequest['status'],
-            'transactionId' => $this->parsedRequest['transactionId'],
-            'customInvoiceId' => $this->parsedRequest['customInvoiceId'],
-        );
-
-        ksort($hashData);
-        $hashString = json_encode($hashData);
-        $computedHash = hash_hmac('sha256', $hashString, $this->getPlugin()->getConfig('site_secret_key'));
-
-        // Retrieve the hash from the X-Signature header
-        $receivedHash = $this->request->getHeader('X-Signature');
-        if (is_null($receivedHash)) {
-            // Log or handle the missing hash case
-            throw new Am_Exception_Paysystem("X-Signature header is missing");
+        // Check if timestamp is recent (e.g., within 5 minutes) to prevent replay attacks.
+        if (time() - (int)$received_timestamp > 300) {
+            $this->getPlugin()->logError("IPN: Webhook timestamp is too old.", array('received_timestamp' => $received_timestamp));
+            throw new Am_Exception_Paysystem("Webhook timestamp too old");
         }
 
-        return hash_equals($computedHash, $receivedHash);
+        // Recreate the signature string.
+        $string_to_sign = $received_timestamp . '.' . $raw_body;
+        $computed_hash = hash_hmac('sha256', $string_to_sign, $this->getPlugin()->getConfig('site_secret_key'));
+
+        // Securely compare the signatures.
+        if (!hash_equals($computed_hash, $received_signature)) {
+            $this->getPlugin()->logError("IPN: Invalid signature.", array(
+                'string_to_hash' => $string_to_sign,
+                'computed_hash' => $computed_hash,
+                'received_signature' => $received_signature
+            ));
+            return false;
+        }
+
+        return true;
     }
 
     public function validateTerms()
@@ -215,7 +227,8 @@ class Am_Paysystem_Transaction_MultiPaymentGateway extends Am_Paysystem_Transact
     public function validateStatus()
     {
         $status = $this->parsedRequest['status'];
-        return in_array($status, ['0', '1', '2', '3', '4']);
+        // Status is now an integer
+        return in_array($status, [-2, -1, 0, 1, 2, 3, 4]);
     }
 
     public function findInvoiceId()
@@ -225,32 +238,38 @@ class Am_Paysystem_Transaction_MultiPaymentGateway extends Am_Paysystem_Transact
 
     public function getUniqId()
     {
-        return $this->parsedRequest['transactionId'];
+        return $this->parsedRequest['id']; // Use the main transaction ID
     }
 
     public function processValidated()
     {
         switch ($this->parsedRequest['status']) {
-            case "0": // pending
-                // do nothing
+            case 0: // pending
+            case -1: // initiated
+                // do nothing for pending/initiated
                 break;
-            case '1': // successful
+            case 1: // successful
                 if ($this->invoice->status != Invoice::PAID) {
                     $this->invoice->addPayment($this);
                 }
                 break;
-            case '2': // failed
+            case 2: // failed
                 if ($this->invoice->status == Invoice::PAID) {
                     $this->invoice->addVoid($this, $this->getUniqId());
                 }
                 break;
-            case '3': // refunded
+            case 3: // refunded
                 if ($this->invoice->status == Invoice::PAID) {
                     $this->invoice->addRefund($this, $this->getUniqId());
                 }
                 break;
-            case '4': // chargeback
+            case 4: // chargeback
                 $this->invoice->addChargeback($this, $this->getUniqId());
+                break;
+            case -2: // cancelled
+                if ($this->invoice->status != Invoice::CANCELLED && $this->invoice->status != Invoice::PAID) {
+                    $this->invoice->setCancelled(true);
+                }
                 break;
             default:
                 // Do nothing for other statuses
