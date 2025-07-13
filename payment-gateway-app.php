@@ -12,8 +12,8 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
     const PLUGIN_STATUS = self::STATUS_PRODUCTION;
     const PLUGIN_REVISION = '1.0.1';
 
-    protected $defaultTitle = 'payment-gateway-app';
-    protected $defaultDescription = 'Pay securely with your credit card, debit card or bank account.';
+    protected $defaultTitle = 'Secure Checkout via payment-gateway.app';
+    protected $defaultDescription = 'Pay securely with credit/debit cards, crypto, bank transfer, or local options.';
 
     public function _initSetupForm(Am_Form_Setup $form)
     {
