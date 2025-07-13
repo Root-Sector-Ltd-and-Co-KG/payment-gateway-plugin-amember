@@ -12,6 +12,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Update PLUGIN_REVISION in PHP file
+        run: |
+          sed -i "s/const PLUGIN_REVISION = '[^']*';/const PLUGIN_REVISION = '${{ github.ref_name }}';/" payment-gateway-app.php
+
       - name: Print Release Version
         run: echo Release version is ${{ github.ref_name }}
 
