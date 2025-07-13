@@ -16,17 +16,17 @@ jobs:
         run: echo Release version is ${{ github.ref_name }}
 
       - name: Create Subfolder
-        run: mkdir -p multi-payment-gateway && find . -maxdepth 1 -type f -exec mv {} multi-payment-gateway/ \; && find . -maxdepth 1 -type d ! -name multi-payment-gateway ! -name . -exec mv {} multi-payment-gateway/ \; && rm -rf multi-payment-gateway/.git* multi-payment-gateway/.github
+        run: mkdir -p payment-gateway-app && find . -maxdepth 1 -type f -exec mv {} payment-gateway-app/ \; && find . -maxdepth 1 -type d ! -name payment-gateway-app ! -name . -exec mv {} payment-gateway-app/ \; && rm -rf payment-gateway-app/.git* payment-gateway-app/.github
 
       - name: Archive Release
         uses: thedoctor0/zip-release@0.7.6
         with:
           type: "zip"
-          filename: multi-payment-gateway_v${{ github.ref_name }}.zip
-          exclusions: "multi-payment-gateway/RELEASE.md *.git* *.github*"
+          filename: payment-gateway-app_v${{ github.ref_name }}.zip
+          exclusions: "payment-gateway-app/RELEASE.md *.git* *.github*"
 
       - name: Upload Release
         uses: ncipollo/release-action@v1
         with:
-          artifacts: multi-payment-gateway_v${{ github.ref_name }}.zip
+          artifacts: payment-gateway-app_v${{ github.ref_name }}.zip
           token: ${{ secrets.GITHUB_TOKEN }}
