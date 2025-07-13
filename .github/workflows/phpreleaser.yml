@@ -1,5 +1,12 @@
 name: phpreleaser
 
+# Grant GITHUB_TOKEN the rights it needs
+permissions:
+  contents: write        # gives access to create Releases via the REST API
+  issues: write          # optional, if you want to comment on PRs/issues
+  pull-requests: write   # optional, same
+  packages: write        # optional, if you publish packages
+
 on:
   pull_request:
   push:
@@ -12,6 +19,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Update PLUGIN_REVISION in PHP file
         run: |
