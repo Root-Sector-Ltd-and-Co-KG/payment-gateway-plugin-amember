@@ -1,46 +1,45 @@
 <?php
 /**
  * @table paysystems
- * @id multi-payment-gateway
- * @title Multi Payment Gateway
- * @visible_link https://root-sector.com
+ * @id payment-gateway-app
+ * @title Payment Gateway App
+ * @visible_link https://payment-gateway.app
  * @recurring none
  * @am_payment_api 6.0
  */
-class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
+class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
 {
     const PLUGIN_STATUS = self::STATUS_PRODUCTION;
-    const PLUGIN_REVISION = '1.0.0';
+    const PLUGIN_REVISION = '1.0.1';
 
-    protected $defaultTitle = 'multi-payment-gateway';
+    protected $defaultTitle = 'payment-gateway-app';
     protected $defaultDescription = 'Pay securely with your credit card, debit card or bank account.';
 
     public function _initSetupForm(Am_Form_Setup $form)
     {
-        $form->addText('mpg_main_backend_domain')
-            ->setLabel(___("Default Main Backend Domain\n" .
-                'Your Multi Payment Gateway main backend domain without the protocol. For example, use "example.com" instead of "https://example.com".'))
+        $form->addText('api_domain')
+            ->setLabel(___("API Domain\n" .
+                'API Domain of your Payment Gateway App without protocol. Example: api.payment-gateway.app (instead of "https://api.payment-gateway.app").'))
             ->addRule('required');
         $form->addText('site_id')
             ->setLabel(___("Site ID\n" .
-                'Your Multi Payment Gateway site ID.'))
+                'The Site ID shown in your Payment Gateway App dashboard under Sites.'))
             ->addRule('required');
         $form->addText('site_secret_key', array('size' => 100))
             ->setLabel(___("Site Secret Key\n" .
-                'Your Multi Payment Gateway site secret key.'))
+                'Related secret key for this site.'))
             ->addRule('required');
-
         $form->addAdvCheckbox('pass_billing_address')
             ->setLabel(___("Pass Billing Address\n" .
-                'Enable passing billing address.'));
+                'Send the customer’s billing address to the payment gateway app.'));
         $form->addAdvCheckbox('pass_items')
             ->setLabel(___("Pass Items\n" .
-                'Enable passing items.'));
+                'Send invoice line-items to the payment gateway app.'));
     }
 
     public function _process($invoice, $request, $result)
     {
-        $paymentSessionUrl = 'https://' . rtrim($this->getConfig('mpg_main_backend_domain'), '/') . '/api/v1/sessions/create';
+        $paymentSessionUrl = 'https://' . rtrim($this->getConfig('api_domain'), '/') . '/api/v1/sessions/create';
         $request = new Am_HttpRequest($paymentSessionUrl, Am_HttpRequest::METHOD_POST);
         $amount = round($invoice->first_total * 100); // Convert to cents
         $hashData = array(
@@ -120,27 +119,27 @@ class Am_Paysystem_MultiPaymentGateway extends Am_Paysystem_Abstract
 
     public function getReadme()
     {
-        $url = $this->getDi()->surl('payment/multi-payment-gateway/ipn');
+        $url = $this->getDi()->surl('payment/payment-gateway-app/ipn');
         return <<<CUT
-    <b>aMember Multi Payment Gateway plugin setup</b>
+    <b>aMember Payment Gateway app plugin setup</b>
 
-    - Enter the main backend domain for your Multi Payment Gateway configuration in "Default Main Backend Domain".
-    - Get your Site Secret from your Multi Payment Gateway and enter it in "Site Secret".
+    1. Enter your backend domain in "API Domain" (e.g. api.payment-gateway.app).
+    2. Copy the Site ID and Site Secret Key from Payment Gateway App > Sites and paste them here.
 CUT;
     }
 
     public function createThanksTransaction($request, $response, array $invokeArgs)
     {
-        return new Am_Paysystem_Transaction_MultiPaymentGateway_Thanks($this, $request, $response, $invokeArgs);
+        return new Am_Paysystem_Transaction_PaymentGatewayApp_Thanks($this, $request, $response, $invokeArgs);
     }
 
     public function createTransaction($request, $response, array $invokeArgs)
     {
-        return new Am_Paysystem_Transaction_MultiPaymentGateway($this, $request, $response, $invokeArgs);
+        return new Am_Paysystem_Transaction_PaymentGatewayApp($this, $request, $response, $invokeArgs);
     }
 }
 
-class Am_Paysystem_Transaction_MultiPaymentGateway_Thanks extends Am_Paysystem_Transaction_Incoming_Thanks
+class Am_Paysystem_Transaction_PaymentGatewayApp_Thanks extends Am_Paysystem_Transaction_Incoming_Thanks
 {
     public function findInvoiceId()
     {
@@ -173,7 +172,7 @@ class Am_Paysystem_Transaction_MultiPaymentGateway_Thanks extends Am_Paysystem_T
     }
 }
 
-class Am_Paysystem_Transaction_MultiPaymentGateway extends Am_Paysystem_Transaction_Incoming
+class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transaction_Incoming
 {
     protected $parsedRequest;
 
