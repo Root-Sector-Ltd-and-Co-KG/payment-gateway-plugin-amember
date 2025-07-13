@@ -23,14 +23,14 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
             ->addRule('required');
         $form->addText('site_id')
             ->setLabel(___("Site ID\n" .
-                'The Site ID shown in your Payment Gateway App dashboard under Sites.'))
+                'Copy the Site ID from Payment Gateway App Dashboard > Sites.'))
             ->addRule('required');
         $form->addText('site_secret_key', array('size' => 100))
             ->setLabel(___("Site Secret Key\n" .
-                'Related secret key for this site.'))
+                'Copy the site secret key from Payment Gateway App Dashboard > Sites.'))
             ->addRule('required');
         $form->addAdvCheckbox('pass_billing_address')
-            ->setLabel(___("Pass Billing Address\n" .
+            ->setLabel(___("Enable passing billing address\n" .
                 'Send the customer’s billing address to the payment gateway app.'));
         $form->addAdvCheckbox('pass_items')
             ->setLabel(___("Pass Items\n" .
