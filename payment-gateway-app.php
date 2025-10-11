@@ -56,10 +56,10 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
         // Conditionally add billing and shipping fields
         if ($this->getConfig('pass_billing_address')) {
             $hashData['billingAddress'] = array(
-                'firstName' => $invoice->getFirstName(),
-                'lastName' => $invoice->getLastName(),
-                'address1' => $invoice->getStreet(),
-                'city' => $invoice->getCity(),
+                'firstName' => html_entity_decode($invoice->getFirstName(), ENT_QUOTES | ENT_HTML5, 'UTF-8'),
+                'lastName' => html_entity_decode($invoice->getLastName(), ENT_QUOTES | ENT_HTML5, 'UTF-8'),
+                'address1' => html_entity_decode($invoice->getStreet(), ENT_QUOTES | ENT_HTML5, 'UTF-8'),
+                'city' => html_entity_decode($invoice->getCity(), ENT_QUOTES | ENT_HTML5, 'UTF-8'),
                 'postcode' => $invoice->getZip(),
                 'country' => $invoice->getCountry(),
             );
@@ -70,7 +70,7 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
             $items = array();
             foreach ($invoice->getItems() as $item) {
                 $items[] = array(
-                    'name' => $item->item_title,
+                    'name' => html_entity_decode($item->item_title, ENT_QUOTES | ENT_HTML5, 'UTF-8'),
                     'quantity' => $item->qty,
                     'amount' => round($item->first_total * 100),
                     'type' => 'virtual',
