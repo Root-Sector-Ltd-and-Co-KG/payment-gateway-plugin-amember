@@ -21,13 +21,18 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
             ->setLabel(___("API Domain\n" .
                 'API Domain of your Payment Gateway App without protocol. Example: api.payment-gateway.app (instead of "https://api.payment-gateway.app").'))
             ->addRule('required');
+        $form->addText('api_key', array('size' => 100))
+            ->setLabel(___("API Key\n" .
+                'Create an API Key with checkout:create scope from Payment Gateway App Dashboard > API Keys. Format: sk_...'))
+            ->addRule('required');
         $form->addText('site_id')
             ->setLabel(___("Site ID\n" .
                 'Copy the Site ID from Payment Gateway App Dashboard > Sites.'))
             ->addRule('required');
-        $form->addText('site_secret_key', array('size' => 100))
-            ->setLabel(___("Site Secret Key\n" .
-                'Copy the site secret key from Payment Gateway App Dashboard > Sites.'))
+        $form->addText('webhook_secret', array('size' => 100))
+            ->setLabel(___("Webhook Signing Secret\n" .
+                'Copy the Webhook Signing Secret from Payment Gateway App Dashboard > Sites > Edit Site. ' .
+                'This secret verifies IPN/webhook notifications (HMAC-SHA256). Starts with whsec_.'))
             ->addRule('required');
         $form->addAdvCheckbox('pass_billing_address')
             ->setLabel(___("Enable passing billing address\n" .
@@ -39,15 +44,14 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
 
     public function _process($invoice, $request, $result)
     {
-        $paymentSessionUrl = 'https://' . rtrim($this->getConfig('api_domain'), '/') . '/api/v1/sessions/create';
-        $request = new Am_HttpRequest($paymentSessionUrl, Am_HttpRequest::METHOD_POST);
+        $paymentSessionUrl = 'https://' . rtrim($this->getConfig('api_domain'), '/') . '/v1/checkouts/' . $this->getConfig('site_id') . '/create';
+        $httpRequest = new Am_HttpRequest($paymentSessionUrl, Am_HttpRequest::METHOD_POST);
         $amount = round($invoice->first_total * 100); // Convert to cents
         $hashData = array(
             'amount' => $amount,
             'currency' => $invoice->currency,
             'email' => $invoice->getEmail(),
-            'customInvoiceId' => $invoice->public_id,
-            //'returnUrl' => $this->getPluginUrl('thanks') . '?customInvoiceId=' . urlencode($invoice->public_id),
+            'externalReference' => $invoice->public_id,
             'returnUrl' => $this->getReturnUrl(),
             'cancelUrl' => $this->getCancelUrl(),
             'ipnUrl' => $this->getPluginUrl('ipn'),
@@ -65,50 +69,61 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
             );
         }
 
-        // Conditionally pass items as virtual
+        // Conditionally pass items
         if ($this->getConfig('pass_items')) {
             $items = array();
             foreach ($invoice->getItems() as $item) {
+                $quantity = max(1, (int)$item->qty);
                 $items[] = array(
-                    'name' => html_entity_decode($item->item_title, ENT_QUOTES | ENT_HTML5, 'UTF-8'),
-                    'quantity' => $item->qty,
-                    'amount' => round($item->first_total * 100),
-                    'type' => 'virtual',
+                    'description' => html_entity_decode($item->item_title, ENT_QUOTES | ENT_HTML5, 'UTF-8'),
+                    'quantity' => $quantity,
+                    'unitPrice' => round(($item->first_total / $quantity) * 100),
+                    'itemType' => 'virtual',
                 );
             }
+
+            // Correct for rounding errors by ensuring the sum of items exactly equals the total amount.
+            $items_total_cents = 0;
+            foreach ($items as $it) {
+                $items_total_cents += $it['unitPrice'] * $it['quantity'];
+            }
+            $diff_cents = $amount - $items_total_cents;
+            if ($diff_cents != 0 && count($items) > 0) {
+                $items[count($items) - 1]['unitPrice'] += $diff_cents;
+            }
+
             $hashData['items'] = $items;
         }
 
-        // Set the request headers
-        $request->setHeader('Content-Type', 'application/json');
-        $request->setHeader('Site-Id', $this->getConfig('site_id'));
-        $request->setHeader('Site-Secret-Key', $this->getConfig('site_secret_key'));
+        // Set the request headers (API Key authentication)
+        $httpRequest->setHeader('Content-Type', 'application/json');
+        $httpRequest->setHeader('Authorization', 'Bearer ' . $this->getConfig('api_key'));
 
         // Set the request body as JSON
-        $request->setBody(json_encode($hashData));
+        $httpRequest->setBody(json_encode($hashData));
 
-        $log = $this->logRequest($request);
-        $response = $request->send();
+        $log = $this->logRequest($httpRequest);
+        $response = $httpRequest->send();
         $log->add($response);
 
-        if ($response->getStatus() == 406) {
-            $errorBody = json_decode($response->getBody(), true);
-            if (isset($errorBody['error'])) {
-                throw new Am_Exception_FatalError($errorBody['error']);
+        $responseCode = $response->getStatus();
+        $responseBody = json_decode($response->getBody(), true);
+
+        if ($responseCode !== 200) {
+            $errorMessage = isset($responseBody['error']) ? $responseBody['error'] : $response->getBody();
+            if ($responseCode === 401) {
+                throw new Am_Exception_FatalError("Authentication failed. Please check your API Key configuration.");
             }
-            throw new Am_Exception_FatalError($response->getBody());
-        } else if ($response->getStatus() != 200) {
-            throw new Am_Exception_InternalError("Can't create payment session. Got:" . $response->getBody());
+            throw new Am_Exception_FatalError("Payment session creation failed: " . $errorMessage);
         }
 
-        $r = json_decode($response->getBody(), true);
-        if (!isset($r['paymentUrl'])) {
-            $result->setFailed('Payment session creation failed. Reason: ' . $r['error']);
+        if (!isset($responseBody['paymentUrl'])) {
+            $errorMessage = isset($responseBody['error']) ? $responseBody['error'] : 'missing paymentUrl in response';
+            $result->setFailed('Payment session creation failed. Reason: ' . $errorMessage);
             return;
         }
 
-        $payment_url = $r['paymentUrl'];
-        $a = new Am_Paysystem_Action_Redirect($payment_url);
+        $a = new Am_Paysystem_Action_Redirect($responseBody['paymentUrl']);
         $result->setAction($a);
     }
 
@@ -124,7 +139,8 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
     <b>aMember Payment Gateway app plugin setup</b>
 
     1. Enter your backend domain in "API Domain" (e.g. api.payment-gateway.app).
-    2. Copy the Site ID and Site Secret Key from Payment Gateway App > Sites and paste them here.
+    2. Create an API Key in Payment Gateway App Dashboard > API Keys and paste it in "API Key".
+    3. Copy the Site ID from Payment Gateway App Dashboard > Sites and paste it in "Site ID".
 CUT;
     }
 
@@ -143,7 +159,7 @@ class Am_Paysystem_Transaction_PaymentGatewayApp_Thanks extends Am_Paysystem_Tra
 {
     public function findInvoiceId()
     {
-        return $this->request->getFiltered('customInvoiceId');
+        return $this->request->getFiltered('externalReference');
     }
 
     public function getUniqId()
@@ -195,24 +211,32 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
             throw new Am_Exception_Paysystem("Signature headers missing");
         }
 
+        if (!is_numeric($received_timestamp)) {
+            $this->getPlugin()->logError("IPN: Invalid signature timestamp.", array('received_timestamp' => $received_timestamp));
+            throw new Am_Exception_Paysystem("Invalid signature timestamp");
+        }
+
         // Check if timestamp is recent (e.g., within 5 minutes) to prevent replay attacks.
-        if (time() - (int)$received_timestamp > 300) {
+        if (abs(time() - (int)$received_timestamp) > 300) {
             $this->getPlugin()->logError("IPN: Webhook timestamp is too old.", array('received_timestamp' => $received_timestamp));
             throw new Am_Exception_Paysystem("Webhook timestamp too old");
         }
 
-        // Recreate the signature string.
+        // Recreate the signature string and verify using the webhook signing secret.
         $string_to_sign = $received_timestamp . '.' . $raw_body;
-        $computed_hash = hash_hmac('sha256', $string_to_sign, $this->getPlugin()->getConfig('site_secret_key'));
+        $computed_hash = hash_hmac('sha256', $string_to_sign, $this->getPlugin()->getConfig('webhook_secret'));
 
-        // Securely compare the signatures.
+        // Securely compare the signatures (timing-safe).
         if (!hash_equals($computed_hash, $received_signature)) {
-            $this->getPlugin()->logError("IPN: Invalid signature.", array(
-                'string_to_hash' => $string_to_sign,
-                'computed_hash' => $computed_hash,
-                'received_signature' => $received_signature
-            ));
+            $this->getPlugin()->logError("IPN: Invalid signature.");
+            http_response_code(400);
+            echo "Invalid signature";
             return false;
+        }
+
+        if (!isset($this->parsedRequest['id'], $this->parsedRequest['externalReference'], $this->parsedRequest['status'])) {
+            $this->getPlugin()->logError("IPN: Missing required fields.", $this->parsedRequest);
+            throw new Am_Exception_Paysystem("Missing required fields");
         }
 
         return true;
@@ -225,14 +249,18 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     public function validateStatus()
     {
-        $status = $this->parsedRequest['status'];
+        if (!isset($this->parsedRequest['status']) || !is_numeric($this->parsedRequest['status'])) {
+            $this->getPlugin()->logError("IPN: Invalid status field.", $this->parsedRequest);
+            return false;
+        }
+        $status = (int)$this->parsedRequest['status'];
         // Status is now an integer
         return in_array($status, [-2, -1, 0, 1, 2, 3, 4]);
     }
 
     public function findInvoiceId()
     {
-        return $this->parsedRequest['customInvoiceId'];
+        return $this->parsedRequest['externalReference'];
     }
 
     public function getUniqId()
