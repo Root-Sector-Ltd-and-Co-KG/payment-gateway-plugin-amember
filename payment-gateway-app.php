@@ -13,7 +13,7 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
     const PLUGIN_REVISION = 'dev';
 
     protected $defaultTitle = 'Secure Checkout via payment-gateway.app';
-    protected $defaultDescription = 'Pay securely with credit/debit cards, crypto, bank transfer, or local options.';
+    protected $defaultDescription = 'Pay securely with credit/debit cards, crypto, wire transfer, or local options.';
 
     public function _initSetupForm(Am_Form_Setup $form)
     {
