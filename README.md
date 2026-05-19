@@ -29,14 +29,14 @@ Payment Gateway App.
 2. Select the **Payment Gateway App** tab.
 3. Fill in the fields:
 
-| Field | Description |
-|---|---|
-| **API Domain** | Domain of your Payment Gateway backend (e.g. `api.payment-gateway.app`, **without** `https://`). |
-| **Site ID** | Value shown in Payment Gateway App admin → Sites → Edit. |
-| **API Key** | Create one under Payment Gateway App admin → API Keys with `checkout:write` scope. |
+| Field                      | Description                                                                                          |
+| -------------------------- | ---------------------------------------------------------------------------------------------------- |
+| **API Domain**             | Domain of your Payment Gateway backend (e.g. `api.payment-gateway.app`, **without** `https://`).     |
+| **Site ID**                | Value shown in Payment Gateway App admin → Sites → Edit.                                             |
+| **API Key**                | Create one under Payment Gateway App admin → API Keys with `checkout:write` scope.                   |
 | **Webhook Signing Secret** | The `whsec_`-prefixed secret from Payment Gateway App admin → Sites → Edit → Webhook Signing Secret. |
-| *Pass Billing Address* | Optional – sends customer billing data for fraud checks. |
-| *Pass Items* | Optional – sends line-item details to the checkout session. |
+| _Pass Billing Address_     | Optional – sends customer billing data for fraud checks.                                             |
+| _Pass Items_               | Optional – sends line-item details to the checkout session.                                          |
 
 4. Click **Save**.
 
@@ -51,13 +51,20 @@ The plugin registers a secure IPN endpoint automatically:
 When a transaction status changes, Payment Gateway App sends a POST
 request to this URL. Each request includes two signature headers:
 
-| Header | Purpose |
-|---|---|
-| `X-Signature-Timestamp` | Unix timestamp (seconds) of when the request was signed |
+| Header                    | Purpose                                                                          |
+| ------------------------- | -------------------------------------------------------------------------------- |
+| `X-Signature-Timestamp`   | Unix timestamp (seconds) of when the request was signed                          |
 | `X-Signature-HMAC-SHA256` | HMAC-SHA256 hex digest of `{timestamp}.{body}` using your Webhook Signing Secret |
 
 The plugin verifies both headers before processing. Requests with
 invalid or missing signatures are rejected and logged.
+
+## Troubleshooting logs
+
+aMember may log payment-session and IPN failures when error reporting is
+enabled. Those logs can include API error text and request metadata. Avoid
+verbose logging on production unless you are diagnosing an issue, and
+restrict access to log files to trusted administrators.
 
 **Replay protection:** Requests with a timestamp older than 5 minutes
 are automatically rejected.

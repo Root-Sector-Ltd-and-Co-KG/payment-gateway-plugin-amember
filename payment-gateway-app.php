@@ -42,6 +42,25 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
                 'Send invoice line-items to the payment gateway app.'));
     }
 
+    /**
+     * Prefer API `message`, then legacy `error` field.
+     *
+     * @param array<string, mixed>|null $responseBody
+     */
+    private function getApiErrorMessage($responseBody, $fallback)
+    {
+        if (!is_array($responseBody)) {
+            return $fallback;
+        }
+        if (!empty($responseBody['message']) && is_string($responseBody['message'])) {
+            return $responseBody['message'];
+        }
+        if (!empty($responseBody['error']) && is_string($responseBody['error'])) {
+            return $responseBody['error'];
+        }
+        return $fallback;
+    }
+
     public function _process($invoice, $request, $result)
     {
         $paymentSessionUrl = 'https://' . rtrim($this->getConfig('api_domain'), '/') . '/v1/checkouts/' . $this->getConfig('site_id') . '/create';
@@ -110,7 +129,7 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
         $responseBody = json_decode($response->getBody(), true);
 
         if ($responseCode !== 200) {
-            $errorMessage = isset($responseBody['error']) ? $responseBody['error'] : $response->getBody();
+            $errorMessage = $this->getApiErrorMessage($responseBody, $response->getBody());
             if ($responseCode === 401) {
                 throw new Am_Exception_FatalError("Authentication failed. Please check your API Key configuration.");
             }
@@ -118,7 +137,7 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
         }
 
         if (!isset($responseBody['paymentUrl'])) {
-            $errorMessage = isset($responseBody['error']) ? $responseBody['error'] : 'missing paymentUrl in response';
+            $errorMessage = $this->getApiErrorMessage($responseBody, 'missing paymentUrl in response');
             $result->setFailed('Payment session creation failed. Reason: ' . $errorMessage);
             return;
         }
