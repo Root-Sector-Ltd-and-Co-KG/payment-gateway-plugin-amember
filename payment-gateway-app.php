@@ -97,7 +97,7 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
                     'description' => html_entity_decode($item->item_title, ENT_QUOTES | ENT_HTML5, 'UTF-8'),
                     'quantity' => $quantity,
                     'unitPrice' => round(($item->first_total / $quantity) * 100),
-                    'itemType' => 'virtual',
+                    'itemType' => 'digital_service',
                 );
             }
 
