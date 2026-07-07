@@ -169,6 +169,73 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
         $this->logOther('Payment Gateway App checkout ' . $stage, $safeContext);
     }
 
+    private function getApiScalar($responseBody, array $keys)
+    {
+        if (!is_array($responseBody)) {
+            return '';
+        }
+        foreach ($keys as $key) {
+            if (!empty($responseBody[$key]) && is_scalar($responseBody[$key])) {
+                return (string)$responseBody[$key];
+            }
+        }
+        return '';
+    }
+
+    private function getApiRequestId($responseBody)
+    {
+        return $this->getApiScalar($responseBody, array('requestId', 'requestID'));
+    }
+
+    private function formatCustomerApiError($responseBody, $fallback)
+    {
+        $message = trim($this->getApiErrorMessage($responseBody, $fallback));
+        $code = $this->getApiScalar($responseBody, array('code'));
+
+        if ($code === 'CHECKOUT_BLOCKED_BY_DISPUTE') {
+            $message = 'Payment cannot be started because an unresolved dispute is being reviewed. Please contact support.';
+        } elseif ($code === 'CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD') {
+            $message = 'Payment cannot be started because this customer account is under merchant review. Please contact support.';
+        } elseif ($code === 'CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD') {
+            $message = 'Only bank transfer payment methods are available for this account. Please choose an available bank transfer option or contact support.';
+        }
+
+        $requestId = $this->getApiRequestId($responseBody);
+        if ($requestId !== '') {
+            $message .= ' Request ID: ' . $requestId;
+        }
+        return $message;
+    }
+
+    private function logGatewayApiError($responseBody, $httpStatus)
+    {
+        if (!is_array($responseBody)) {
+            return;
+        }
+
+        $context = array(
+            'httpStatus' => $httpStatus,
+            'code' => $this->getApiScalar($responseBody, array('code')),
+            'requestId' => $this->getApiRequestId($responseBody),
+            'transactionId' => $this->getApiScalar($responseBody, array('transactionId')),
+            'externalReference' => $this->getApiScalar($responseBody, array('externalReference')),
+            'customerRiskHoldId' => $this->getApiScalar($responseBody, array('customerRiskHoldId')),
+            'customerRiskAction' => $this->getApiScalar($responseBody, array('customerRiskAction')),
+            'customerRiskReason' => $this->getApiScalar($responseBody, array('customerRiskReason')),
+            'disputeId' => $this->getApiScalar($responseBody, array('disputeId')),
+            'disputeStatus' => $this->getApiScalar($responseBody, array('disputeStatus', 'chargebackStatus')),
+        );
+        $safeContext = array();
+        foreach ($context as $key => $value) {
+            if ($value !== '' && $value !== null) {
+                $safeContext[$key] = $value;
+            }
+        }
+        if (!empty($safeContext)) {
+            $this->logError('Payment Gateway App API error', $safeContext);
+        }
+    }
+
     public function _process($invoice, $request, $result)
     {
         $paymentSessionUrl = 'https://' . rtrim($this->getConfig('api_domain'), '/') . '/v1/checkouts/' . $this->getConfig('site_id') . '/create';
