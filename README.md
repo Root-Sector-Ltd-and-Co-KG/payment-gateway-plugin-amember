@@ -62,9 +62,18 @@ invalid or missing signatures are rejected and logged.
 ## Troubleshooting logs
 
 aMember may log payment-session and IPN failures when error reporting is
-enabled. Those logs can include API error text and request metadata. Avoid
-verbose logging on production unless you are diagnosing an issue, and
-restrict access to log files to trusted administrators.
+enabled. The plugin logs safe gateway metadata such as gateway code, request
+ID, transaction ID, external reference, dispute status, and customer-risk-hold
+fields instead of full checkout request bodies. Avoid verbose logging on
+production unless you are diagnosing an issue, and restrict access to log files
+to trusted administrators.
+
+Checkout requests blocked by an unresolved dispute use
+`CHECKOUT_BLOCKED_BY_DISPUTE` and show a customer-safe support message with the
+gateway request ID when available. Final merchant-loss customer risk holds use
+`CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD`; when safe methods are allowed,
+`CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD` asks the customer to choose an available
+bank-transfer option such as wire or Wise.
 
 **Replay protection:** Requests with a timestamp older than 5 minutes
 are automatically rejected.
@@ -77,6 +86,7 @@ the value in the aMember plugin settings.
 
 ### 1.0.2
 
+- Enhancement: Display and log customer-risk-hold checkout blocks and safe bank-transfer restrictions with request IDs.
 - Security: Replaced Site Secret Key with dedicated Webhook Signing Secret (`whsec_` prefix) for IPN verification.
 - Security: Added separate API Key field for checkout session authentication.
 - Enhancement: Improved webhook verification with HMAC-SHA256 + timestamp replay protection.
