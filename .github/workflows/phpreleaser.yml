@@ -22,12 +22,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve Plugin Version
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${{ github.ref_name }}"
+          else
+            version="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+            version="${version//\//-}"
+          fi
+          echo "PLUGIN_RELEASE_VERSION=${version}" >> "$GITHUB_ENV"
+
       - name: Update PLUGIN_REVISION in PHP file
         run: |
-          sed -i "s/const PLUGIN_REVISION = '[^']*';/const PLUGIN_REVISION = '${{ github.ref_name }}';/" payment-gateway-app.php
+          sed -i "s/const PLUGIN_REVISION = '[^']*';/const PLUGIN_REVISION = '${PLUGIN_RELEASE_VERSION}';/" payment-gateway-app.php
 
       - name: Print Release Version
-        run: echo Release version is ${{ github.ref_name }}
+        run: echo "Release version is ${PLUGIN_RELEASE_VERSION}"
 
       - name: Create Subfolder
         run: mkdir -p payment-gateway-app && find . -maxdepth 1 -type f -exec mv {} payment-gateway-app/ \; && find . -maxdepth 1 -type d ! -name payment-gateway-app ! -name . -exec mv {} payment-gateway-app/ \; && rm -rf payment-gateway-app/.git* payment-gateway-app/.github
@@ -36,11 +46,12 @@ jobs:
         uses: thedoctor0/zip-release@0.7.6
         with:
           type: "zip"
-          filename: payment-gateway-app_v${{ github.ref_name }}.zip
+          filename: payment-gateway-app_v${{ env.PLUGIN_RELEASE_VERSION }}.zip
           exclusions: "payment-gateway-app/RELEASE.md *.git* *.github*"
 
       - name: Upload Release
+        if: github.ref_type == 'tag'
         uses: ncipollo/release-action@v1
         with:
-          artifacts: payment-gateway-app_v${{ github.ref_name }}.zip
+          artifacts: payment-gateway-app_v${{ env.PLUGIN_RELEASE_VERSION }}.zip
           token: ${{ secrets.GITHUB_TOKEN }}
