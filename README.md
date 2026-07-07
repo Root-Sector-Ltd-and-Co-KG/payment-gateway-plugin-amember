@@ -75,14 +75,43 @@ gateway request ID when available. Final merchant-loss customer risk holds use
 `CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD` asks the customer to choose an available
 bank-transfer option such as wire or Wise.
 
+Gateway API errors include the structured gateway code and request ID when
+available. Customers see a safe support message plus the request ID. Admin
+logs include the gateway code, request ID, transaction ID, external reference,
+amount, currency, dispute date, dispute ID/status, and credit-note references
+when the gateway provides them.
+
+Checkout requests blocked by an unresolved dispute are shown as a customer-safe
+message instructing the customer to contact support with the request ID. In the
+gateway this response uses `CHECKOUT_BLOCKED_BY_DISPUTE`.
+
+Dispute IPN payloads may include `disputeStatus`, `chargebackStatus`, nested
+`chargeback.*` fields, or a top-level string `status` such as `open`,
+`under_review`, `won`, `lost`, or `accepted`. Numeric transaction statuses are
+still handled as normal payment status updates when no dispute status is
+present.
+
+For active or merchant-loss dispute statuses (`open`, `under_review`, `lost`,
+`accepted`), the plugin records a chargeback idempotently so repeated IPNs do
+not create duplicate chargebacks. `won` disputes are intentionally manual-only:
+they are logged with request/dispute metadata and return `OK`, but the plugin
+does not automatically clear, reverse, or reopen the aMember invoice.
+
 **Replay protection:** Requests with a timestamp older than 5 minutes
 are automatically rejected.
 
 If you suspect your Webhook Signing Secret has been compromised,
-regenerate it in Payment Gateway App admin → Sites → Edit and update
+regenerate it in Payment Gateway App admin -> Sites -> Edit and update
 the value in the aMember plugin settings.
 
 ## Changelog
+
+### 1.0.6
+
+- Enhancement: Accept dispute-only IPNs with supported dispute status fields, including nested chargeback status and top-level string `status`.
+- Enhancement: Treat `won` disputes as manual-only trace events while recording non-won disputes as idempotent chargebacks.
+- Enhancement: Replace full checkout request/response logging with safe structured checkout and gateway error metadata.
+- Docs: Clarify request ID, dispute, credit-note, and manual won-dispute behavior.
 
 ### 1.0.2
 
@@ -90,6 +119,8 @@ the value in the aMember plugin settings.
 - Security: Replaced Site Secret Key with dedicated Webhook Signing Secret (`whsec_` prefix) for IPN verification.
 - Security: Added separate API Key field for checkout session authentication.
 - Enhancement: Improved webhook verification with HMAC-SHA256 + timestamp replay protection.
+- Enhancement: Display and log Payment Gateway App API request IDs and structured error codes.
+- Enhancement: Log dispute-resolution IPNs, including won/lost/accepted status and credit-note references.
 - Docs: Updated README with Webhook/IPN details and new configuration fields.
 
 ### 1.0.1
