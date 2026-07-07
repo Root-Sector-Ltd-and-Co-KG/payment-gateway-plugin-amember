@@ -43,22 +43,130 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
     }
 
     /**
-     * Prefer API `message`, then legacy `error` field.
+     * Parse structured API errors from Payment Gateway App responses.
      *
      * @param array<string, mixed>|null $responseBody
+     * @return array<string, mixed>
      */
-    private function getApiErrorMessage($responseBody, $fallback)
+    private function getApiErrorDetails($responseBody, $fallback, $httpStatus = null)
     {
+        $details = array(
+            'message' => $fallback,
+            'code' => '',
+            'requestId' => '',
+            'httpStatus' => $httpStatus,
+            'transactionId' => '',
+            'externalReference' => '',
+            'amount' => null,
+            'currency' => '',
+            'disputeDate' => '',
+            'gatewayStatus' => '',
+            'disputeId' => '',
+            'disputeStatus' => '',
+            'chargebackStatus' => '',
+            'creditNoteId' => '',
+            'creditNoteNumber' => '',
+        );
+
         if (!is_array($responseBody)) {
-            return $fallback;
+            return $details;
         }
-        if (!empty($responseBody['message']) && is_string($responseBody['message'])) {
-            return $responseBody['message'];
+
+        foreach (array('message', 'error') as $key) {
+            if (!empty($responseBody[$key]) && is_string($responseBody[$key])) {
+                $details['message'] = $responseBody[$key];
+                break;
+            }
         }
-        if (!empty($responseBody['error']) && is_string($responseBody['error'])) {
-            return $responseBody['error'];
+
+        foreach (array('code', 'requestId', 'requestID', 'transactionId', 'externalReference', 'currency', 'disputeDate', 'disputeId', 'disputeStatus', 'chargebackStatus', 'creditNoteId', 'creditNoteNumber') as $key) {
+            if (!empty($responseBody[$key]) && is_scalar($responseBody[$key])) {
+                $targetKey = $key === 'requestID' ? 'requestId' : $key;
+                $details[$targetKey] = (string)$responseBody[$key];
+            }
         }
-        return $fallback;
+        if (!empty($responseBody['status']) && is_scalar($responseBody['status'])) {
+            $details['gatewayStatus'] = (string)$responseBody['status'];
+        }
+        if (isset($responseBody['chargeback']) && is_array($responseBody['chargeback'])) {
+            foreach (array('disputeId', 'disputeStatus', 'chargebackStatus', 'creditNoteId', 'creditNoteNumber') as $key) {
+                if (empty($details[$key]) && !empty($responseBody['chargeback'][$key]) && is_scalar($responseBody['chargeback'][$key])) {
+                    $details[$key] = (string)$responseBody['chargeback'][$key];
+                }
+            }
+            if (empty($details['disputeId']) && !empty($responseBody['chargeback']['id']) && is_scalar($responseBody['chargeback']['id'])) {
+                $details['disputeId'] = (string)$responseBody['chargeback']['id'];
+            }
+            if (empty($details['requestId'])) {
+                foreach (array('requestId', 'requestID') as $key) {
+                    if (!empty($responseBody['chargeback'][$key]) && is_scalar($responseBody['chargeback'][$key])) {
+                        $details['requestId'] = (string)$responseBody['chargeback'][$key];
+                        break;
+                    }
+                }
+            }
+            if (empty($details['disputeStatus']) && !empty($responseBody['chargeback']['status']) && is_scalar($responseBody['chargeback']['status'])) {
+                $details['disputeStatus'] = (string)$responseBody['chargeback']['status'];
+            }
+        }
+
+        if (isset($responseBody['amount']) && is_numeric($responseBody['amount'])) {
+            $details['amount'] = $responseBody['amount'];
+        }
+
+        return $details;
+    }
+
+    /**
+     * @param array<string, mixed> $details
+     */
+    private function formatCustomerApiError($details)
+    {
+        $message = trim((string)$details['message']);
+        if ((string)$details['code'] === 'CHECKOUT_BLOCKED_BY_DISPUTE') {
+            $message = 'Payment cannot be started because an unresolved dispute is being reviewed. Please contact support.';
+        }
+        if (!empty($details['requestId'])) {
+            $message .= ' Request ID: ' . $details['requestId'];
+        }
+        return $message;
+    }
+
+    /**
+     * @param array<string, mixed> $details
+     */
+    private function logGatewayApiError($details)
+    {
+        $this->logError('Payment Gateway App API error', array(
+            'httpStatus' => $details['httpStatus'],
+            'code' => $details['code'],
+            'message' => $details['message'],
+            'requestId' => $details['requestId'],
+            'transactionId' => $details['transactionId'],
+            'externalReference' => $details['externalReference'],
+            'amount' => $details['amount'],
+            'currency' => $details['currency'],
+            'disputeDate' => $details['disputeDate'],
+            'gatewayStatus' => $details['gatewayStatus'],
+            'disputeId' => $details['disputeId'],
+            'disputeStatus' => $details['disputeStatus'],
+            'chargebackStatus' => $details['chargebackStatus'],
+            'creditNoteId' => $details['creditNoteId'],
+            'creditNoteNumber' => $details['creditNoteNumber'],
+        ));
+    }
+
+
+    private function logCheckoutApiExchange($stage, array $context)
+    {
+        $allowed = array('invoice', 'endpoint', 'httpStatus', 'amount', 'currency', 'itemCount', 'hasBillingAddress', 'requestId', 'code', 'message');
+        $safeContext = array();
+        foreach ($allowed as $key) {
+            if (array_key_exists($key, $context) && $context[$key] !== '' && $context[$key] !== null) {
+                $safeContext[$key] = $context[$key];
+            }
+        }
+        $this->logOther('Payment Gateway App checkout ' . $stage, $safeContext);
     }
 
     public function _process($invoice, $request, $result)
@@ -121,15 +229,30 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
         // Set the request body as JSON
         $httpRequest->setBody(json_encode($hashData));
 
-        $log = $this->logRequest($httpRequest);
+        $this->logCheckoutApiExchange('request', array(
+            'invoice' => $invoice->public_id,
+            'endpoint' => $paymentSessionUrl,
+            'amount' => $amount,
+            'currency' => $invoice->currency,
+            'itemCount' => isset($hashData['items']) ? count($hashData['items']) : 0,
+            'hasBillingAddress' => isset($hashData['billingAddress']),
+        ));
         $response = $httpRequest->send();
-        $log->add($response);
 
         $responseCode = $response->getStatus();
         $responseBody = json_decode($response->getBody(), true);
+        $responseErrorDetails = $this->getApiErrorDetails($responseBody, 'gateway returned a non-JSON error response', $responseCode);
+        $this->logCheckoutApiExchange('response', array(
+            'invoice' => $invoice->public_id,
+            'httpStatus' => $responseCode,
+            'requestId' => $responseErrorDetails['requestId'],
+            'code' => $responseErrorDetails['code'],
+        ));
 
         if ($responseCode !== 200) {
-            $errorMessage = $this->getApiErrorMessage($responseBody, $response->getBody());
+            $errorDetails = $responseErrorDetails;
+            $this->logGatewayApiError($errorDetails);
+            $errorMessage = $this->formatCustomerApiError($errorDetails);
             if ($responseCode === 401) {
                 throw new Am_Exception_FatalError("Authentication failed. Please check your API Key configuration.");
             }
@@ -137,8 +260,9 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
         }
 
         if (!isset($responseBody['paymentUrl'])) {
-            $errorMessage = $this->getApiErrorMessage($responseBody, 'missing paymentUrl in response');
-            $result->setFailed('Payment session creation failed. Reason: ' . $errorMessage);
+            $errorDetails = $this->getApiErrorDetails($responseBody, 'missing paymentUrl in response', $responseCode);
+            $this->logGatewayApiError($errorDetails);
+            $result->setFailed('Payment session creation failed. Reason: ' . $this->formatCustomerApiError($errorDetails));
             return;
         }
 
@@ -211,13 +335,137 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 {
     protected $parsedRequest;
 
+    private function getParsedScalar(array $keys)
+    {
+        foreach ($keys as $key) {
+            $value = $this->parsedRequest;
+            foreach (explode('.', $key) as $part) {
+                if (is_array($value) && isset($value[$part])) {
+                    $value = $value[$part];
+                } else {
+                    continue 2;
+                }
+            }
+            if (is_scalar($value)) {
+                return trim((string)$value);
+            }
+        }
+        return '';
+    }
+
+    private function getDisputeStatus()
+    {
+        foreach (array('disputeStatus', 'chargebackStatus', 'status', 'chargeback.status', 'chargeback.disputeStatus', 'chargeback.chargebackStatus') as $key) {
+            $status = strtolower($this->getParsedScalar(array($key)));
+            if ($this->isSupportedDisputeStatus($status)) {
+                return $status;
+            }
+        }
+        return '';
+    }
+
+    private function isSupportedDisputeStatus($status)
+    {
+        return in_array($status, array('open', 'under_review', 'won', 'lost', 'accepted'), true);
+    }
+
+    private function getRequestId()
+    {
+        return $this->getParsedScalar(array('requestId', 'requestID', 'chargeback.requestId', 'chargeback.requestID'));
+    }
+
+    private function getGatewayTransactionId()
+    {
+        return $this->getParsedScalar(array('id', 'transactionId', 'chargeback.transactionId', 'chargeback.gatewayTransactionId'));
+    }
+
+    private function getExternalReference()
+    {
+        return $this->getParsedScalar(array('externalReference', 'chargeback.externalReference'));
+    }
+
+    private function getSafeWebhookLogContext(array $extra = array())
+    {
+        $context = $extra;
+        $fields = array(
+            'gatewayTransactionId' => $this->getGatewayTransactionId(),
+            'externalReference' => $this->getExternalReference(),
+            'disputeId' => $this->getParsedScalar(array('disputeId', 'chargebackId', 'chargeback.disputeId', 'chargeback.chargebackId', 'chargeback.id')),
+            'disputeStatus' => $this->getDisputeStatus(),
+            'requestId' => $this->getRequestId(),
+            'creditNoteId' => $this->getParsedScalar(array('creditNoteId', 'chargeback.creditNoteId', 'creditNote.id')),
+            'creditNoteNumber' => $this->getParsedScalar(array('creditNoteNumber', 'chargeback.creditNoteNumber', 'creditNote.number')),
+        );
+        if (isset($this->parsedRequest['status']) && is_scalar($this->parsedRequest['status'])) {
+            $fields['status'] = (string)$this->parsedRequest['status'];
+        }
+        foreach ($fields as $key => $value) {
+            if ($value !== '') {
+                $context[$key] = $value;
+            }
+        }
+        return $context;
+    }
+
+    private function logDisputeUpdate($disputeStatus)
+    {
+        $this->getPlugin()->logOther('Payment Gateway App dispute update', array_merge(array(
+            'invoice' => isset($this->invoice) ? $this->invoice->public_id : $this->getExternalReference(),
+        ), $this->getSafeWebhookLogContext(array(
+            'disputeStatus' => $disputeStatus,
+        ))));
+    }
+
+    private function hasExistingChargeback()
+    {
+        if (!isset($this->invoice)) {
+            return false;
+        }
+        $transactionId = (string)$this->getUniqId();
+        foreach ($this->invoice->getRefundRecords() as $refund) {
+            if ((int)$refund->refund_type === InvoiceRefund::CHARGEBACK && (string)$refund->transaction_id === $transactionId) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function addChargebackIdempotently()
+    {
+        if ($this->hasExistingChargeback()) {
+            $this->getPlugin()->logOther('Payment Gateway App chargeback IPN already recorded', array(
+                'invoice' => $this->invoice->public_id,
+                'gatewayTransactionId' => $this->getUniqId(),
+                'requestId' => $this->getRequestId(),
+            ));
+            return;
+        }
+
+        try {
+            $this->invoice->addChargeback($this, $this->getUniqId());
+        } catch (Exception $e) {
+            if ($this->hasExistingChargeback()) {
+                $this->getPlugin()->logOther('Payment Gateway App duplicate chargeback IPN accepted', array(
+                    'invoice' => $this->invoice->public_id,
+                    'gatewayTransactionId' => $this->getUniqId(),
+                    'requestId' => $this->getRequestId(),
+                ));
+                return;
+            }
+            throw $e;
+        }
+    }
+
     public function validateSource()
     {
         $raw_body = $this->request->getRawBody();
         $this->parsedRequest = json_decode($raw_body, true);
 
         if (json_last_error() !== JSON_ERROR_NONE || !is_array($this->parsedRequest)) {
-            $this->getPlugin()->logError("IPN: Invalid JSON received.", $raw_body);
+            $this->getPlugin()->logError("IPN: Invalid JSON received.", array(
+                'jsonError' => json_last_error_msg(),
+                'rawBodyLength' => strlen($raw_body),
+            ));
             throw new Am_Exception_Paysystem("Invalid JSON in request body");
         }
 
@@ -253,8 +501,9 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
             return false;
         }
 
-        if (!isset($this->parsedRequest['id'], $this->parsedRequest['externalReference'], $this->parsedRequest['status'])) {
-            $this->getPlugin()->logError("IPN: Missing required fields.", $this->parsedRequest);
+        $hasDisputeStatus = $this->isSupportedDisputeStatus($this->getDisputeStatus());
+        if ($this->getGatewayTransactionId() === '' || $this->getExternalReference() === '' || (!isset($this->parsedRequest['status']) && !$hasDisputeStatus)) {
+            $this->getPlugin()->logError("IPN: Missing required fields.", $this->getSafeWebhookLogContext(array('reason' => 'missing_required_fields')));
             throw new Am_Exception_Paysystem("Missing required fields");
         }
 
@@ -268,8 +517,11 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     public function validateStatus()
     {
+        if ($this->isSupportedDisputeStatus($this->getDisputeStatus())) {
+            return true;
+        }
         if (!isset($this->parsedRequest['status']) || !is_numeric($this->parsedRequest['status'])) {
-            $this->getPlugin()->logError("IPN: Invalid status field.", $this->parsedRequest);
+            $this->getPlugin()->logError("IPN: Invalid status field.", $this->getSafeWebhookLogContext(array('reason' => 'invalid_status_field')));
             return false;
         }
         $status = (int)$this->parsedRequest['status'];
@@ -279,17 +531,31 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     public function findInvoiceId()
     {
-        return $this->parsedRequest['externalReference'];
+        return $this->getExternalReference();
     }
 
     public function getUniqId()
     {
-        return $this->parsedRequest['id']; // Use the main transaction ID
+        return $this->getGatewayTransactionId(); // Use the main transaction ID
     }
 
     public function processValidated()
     {
-        switch ($this->parsedRequest['status']) {
+        $status = isset($this->parsedRequest['status']) && is_numeric($this->parsedRequest['status'])
+            ? (int)$this->parsedRequest['status']
+            : null;
+        $disputeStatus = $this->getDisputeStatus();
+        if ($this->isSupportedDisputeStatus($disputeStatus)) {
+            $this->logDisputeUpdate($disputeStatus);
+            if ($disputeStatus !== 'won') {
+                $this->addChargebackIdempotently();
+            }
+            echo "OK";
+            http_response_code(200);
+            return;
+        }
+
+        switch ($status) {
             case 0: // pending
             case -1: // initiated
                 // do nothing for pending/initiated
@@ -310,7 +576,10 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
                 }
                 break;
             case 4: // chargeback
-                $this->invoice->addChargeback($this, $this->getUniqId());
+                if ($disputeStatus === 'won') {
+                    break;
+                }
+                $this->addChargebackIdempotently();
                 break;
             case -2: // cancelled
                 if ($this->invoice->status != Invoice::CANCELLED && $this->invoice->status != Invoice::PAID) {
