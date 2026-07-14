@@ -4,6 +4,8 @@ A payment-integration plugin for aMember Pro that connects your site to your
 self-hosted Payment Gateway App instance, giving you access to multiple
 payment processors through a single interface.
 
+**Version:** dev
+
 ## Overview
 
 With this plugin you can offer a seamless checkout experience in aMember
@@ -101,6 +103,18 @@ regenerate it in Payment Gateway App admin -> Sites -> Edit and update
 the value in the aMember plugin settings.
 
 ## Changelog
+
+### 1.1.1
+
+- Fix: Keep the release archive filename, packaged PHP revision, and packaged README version synchronized with the release tag.
+- CI: Reject non-`x.y.z` release tags and releases without a matching changelog entry.
+- Docs: Populate the GitHub release description from the matching changelog section.
+
+### 1.1.0
+
+- Added structured, customer-safe checkout error handling for dispute blocks and customer-risk holds.
+- Hardened gateway error logging by sanitizing identifiers and excluding credentials, billing data, and raw backend messages.
+- Improved dispute IPN handling with idempotent chargeback recording and manual-only handling for won disputes.
 
 ### 1.0.6
 

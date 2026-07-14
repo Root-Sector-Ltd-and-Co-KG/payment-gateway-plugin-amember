@@ -11,11 +11,13 @@ on:
   pull_request:
   push:
     tags:
-      - "*"
+      - "**"
 
 jobs:
   phpreleaser:
     runs-on: ubuntu-latest
+    env:
+      PLUGIN_RELEASE_VERSION: ${{ github.ref_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -26,11 +28,11 @@ jobs:
         run: |
           find . -name '*.php' -print0 | xargs -0 -n1 php -l
           php tests/plugin-load.test.php
+          php tests/release-workflow.test.php
 
-      - name: Update PLUGIN_REVISION in PHP file
+      - name: Prepare release metadata
         if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          sed -i "s/const PLUGIN_REVISION = '[^']*';/const PLUGIN_REVISION = '${PLUGIN_RELEASE_VERSION}';/" payment-gateway-app.php
+        run: php scripts/prepare-release.php "$PLUGIN_RELEASE_VERSION"
 
       - name: Print Release Version
         if: startsWith(github.ref, 'refs/tags/')
@@ -46,11 +48,12 @@ jobs:
         with:
           type: "zip"
           filename: payment-gateway-app_v${{ env.PLUGIN_RELEASE_VERSION }}.zip
-          exclusions: "payment-gateway-app/RELEASE.md payment-gateway-app/tests/* *.git* *.github*"
+          exclusions: "payment-gateway-app/RELEASE.md payment-gateway-app/scripts/* payment-gateway-app/tests/* *.git* *.github*"
 
       - name: Upload Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: ncipollo/release-action@v1
         with:
           artifacts: payment-gateway-app_v${{ env.PLUGIN_RELEASE_VERSION }}.zip
+          bodyFile: payment-gateway-app/RELEASE.md
           token: ${{ secrets.GITHUB_TOKEN }}
