@@ -33,7 +33,7 @@ Payment Gateway App.
 | -------------------------- | ---------------------------------------------------------------------------------------------------- |
 | **API Domain**             | Domain of your Payment Gateway backend (e.g. `api.payment-gateway.app`, **without** `https://`).     |
 | **Site ID**                | Value shown in Payment Gateway App admin → Sites → Edit.                                             |
-| **API Key**                | Create one under Payment Gateway App admin → API Keys with `checkout:write` scope.                   |
+| **API Key**                | Create one under Payment Gateway App admin → API Keys with `checkout:create` scope.                  |
 | **Webhook Signing Secret** | The `whsec_`-prefixed secret from Payment Gateway App admin → Sites → Edit → Webhook Signing Secret. |
 | _Pass Billing Address_     | Optional – sends customer billing data for fraud checks.                                             |
 | _Pass Items_               | Optional – sends line-item details to the checkout session.                                          |
@@ -80,10 +80,6 @@ available. Customers see a safe support message plus the request ID. Admin
 logs include the gateway code, request ID, transaction ID, external reference,
 amount, currency, dispute date, dispute ID/status, and credit-note references
 when the gateway provides them.
-
-Checkout requests blocked by an unresolved dispute are shown as a customer-safe
-message instructing the customer to contact support with the request ID. In the
-gateway this response uses `CHECKOUT_BLOCKED_BY_DISPUTE`.
 
 Dispute IPN payloads may include `disputeStatus`, `chargebackStatus`, nested
 `chargeback.*` fields, or a top-level string `status` such as `open`,

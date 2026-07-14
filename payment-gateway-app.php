@@ -7,6 +7,136 @@
  * @recurring none
  * @am_payment_api 6.0
  */
+final class PaymentGatewayAppApiErrorContext
+{
+    const MAX_IDENTIFIER_LENGTH = 128;
+    const MAX_PROVIDER_LENGTH = 64;
+    const MAX_PROVIDER_COUNT = 20;
+
+    public static function parse($responseBody, $httpStatus = null)
+    {
+        $data = is_array($responseBody) ? $responseBody : array();
+        $context = array(
+            'httpStatus' => is_numeric($httpStatus) ? (int)$httpStatus : null,
+            'code' => self::identifier(self::scalar($data, array('code', 'error.code'))),
+            'requestId' => self::identifier(self::scalar($data, array('requestId', 'requestID', 'error.requestId', 'error.requestID', 'chargeback.requestId', 'chargeback.requestID', 'error.chargeback.requestId', 'error.chargeback.requestID'))),
+            'transactionId' => self::identifier(self::scalar($data, array('transactionId', 'error.transactionId', 'chargeback.transactionId', 'error.chargeback.transactionId'))),
+            'externalReference' => self::identifier(self::scalar($data, array('externalReference', 'error.externalReference', 'chargeback.externalReference', 'error.chargeback.externalReference'))),
+            'amount' => self::numericValue(self::value($data, array('amount', 'error.amount'))),
+            'currency' => self::identifier(self::scalar($data, array('currency', 'error.currency'))),
+            'disputeDate' => self::identifier(self::scalar($data, array('disputeDate', 'transactionDate', 'error.disputeDate', 'error.transactionDate'))),
+            'gatewayStatus' => self::identifier(self::scalar($data, array('status', 'error.status'))),
+            'disputeId' => self::identifier(self::scalar($data, array('disputeId', 'chargebackId', 'error.disputeId', 'error.chargebackId', 'chargeback.disputeId', 'chargeback.id', 'error.chargeback.disputeId', 'error.chargeback.id'))),
+            'disputeStatus' => self::identifier(self::scalar($data, array('disputeStatus', 'error.disputeStatus', 'chargeback.disputeStatus', 'chargeback.status', 'error.chargeback.disputeStatus', 'error.chargeback.status'))),
+            'chargebackStatus' => self::identifier(self::scalar($data, array('chargebackStatus', 'error.chargebackStatus', 'chargeback.chargebackStatus', 'error.chargeback.chargebackStatus'))),
+            'creditNoteId' => self::identifier(self::scalar($data, array('creditNoteId', 'error.creditNoteId', 'chargeback.creditNoteId', 'creditNote.id', 'error.chargeback.creditNoteId', 'error.creditNote.id'))),
+            'creditNoteNumber' => self::identifier(self::scalar($data, array('creditNoteNumber', 'error.creditNoteNumber', 'chargeback.creditNoteNumber', 'creditNote.number', 'error.chargeback.creditNoteNumber', 'error.creditNote.number'))),
+            'customerRiskHoldId' => self::identifier(self::scalar($data, array('customerRiskHoldId', 'customerRiskHold.id', 'error.customerRiskHoldId', 'error.customerRiskHold.id'))),
+            'customerRiskAction' => self::action(self::scalar($data, array('customerRiskAction', 'customerRiskHold.action', 'error.customerRiskAction', 'error.customerRiskHold.action'))),
+            'customerRiskReason' => self::identifier(self::scalar($data, array('customerRiskReason', 'customerRiskHold.reason', 'error.customerRiskReason', 'error.customerRiskHold.reason'))),
+            'allowedProviderTypes' => self::identifierList(self::arrayValue($data, array('allowedProviderTypes', 'customerRiskHold.allowedProviderTypes', 'error.allowedProviderTypes', 'error.customerRiskHold.allowedProviderTypes'))),
+            'allowedProviderIds' => self::identifierList(self::arrayValue($data, array('allowedProviderIds', 'customerRiskHold.allowedProviderIds', 'error.allowedProviderIds', 'error.customerRiskHold.allowedProviderIds'))),
+        );
+        return $context;
+    }
+
+    public static function customerMessage(array $context, $fallback)
+    {
+        $messages = array(
+            'CHECKOUT_BLOCKED_BY_DISPUTE' => 'Payment cannot be started because an unresolved dispute is being reviewed. Please contact support.',
+            'CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD' => 'Payment cannot be started because this customer account is under merchant review. Please contact support.',
+            'CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD' => 'Only bank transfer payment methods are available for this account. Please choose an available bank transfer option or contact support.',
+        );
+        $code = isset($context['code']) ? (string)$context['code'] : '';
+        $message = isset($messages[$code]) ? $messages[$code] : trim((string)$fallback);
+        if ($message === '') {
+            $message = 'Payment session creation failed due to an unexpected gateway response.';
+        }
+        if (!empty($context['requestId'])) {
+            $message .= ' Request ID: ' . $context['requestId'];
+        }
+        return $message;
+    }
+
+    public static function logContext(array $context, array $extra = array())
+    {
+        $allowed = array('httpStatus', 'code', 'requestId', 'transactionId', 'externalReference', 'amount', 'currency', 'disputeDate', 'gatewayStatus', 'disputeId', 'disputeStatus', 'chargebackStatus', 'creditNoteId', 'creditNoteNumber', 'customerRiskHoldId', 'customerRiskAction', 'customerRiskReason', 'allowedProviderTypes', 'allowedProviderIds');
+        foreach ($allowed as $key) {
+            if (!array_key_exists($key, $context) || $context[$key] === '' || $context[$key] === null || $context[$key] === array()) {
+                continue;
+            }
+            $extra[$key] = $context[$key];
+        }
+        return $extra;
+    }
+
+    private static function value(array $data, array $paths)
+    {
+        foreach ($paths as $path) {
+            $value = $data;
+            foreach (explode('.', $path) as $part) {
+                if (!is_array($value) || !array_key_exists($part, $value)) {
+                    continue 2;
+                }
+                $value = $value[$part];
+            }
+            return $value;
+        }
+        return null;
+    }
+
+    private static function scalar(array $data, array $paths)
+    {
+        $value = self::value($data, $paths);
+        return is_scalar($value) ? trim((string)$value) : '';
+    }
+
+    private static function arrayValue(array $data, array $paths)
+    {
+        $value = self::value($data, $paths);
+        return is_array($value) ? $value : array();
+    }
+
+    private static function identifier($value, $maxLength = self::MAX_IDENTIFIER_LENGTH)
+    {
+        $value = trim((string)$value);
+        if ($value === '' || strlen($value) > $maxLength || !preg_match('/\A[A-Za-z0-9._:-]+\z/', $value)) {
+            return '';
+        }
+        return $value;
+    }
+
+    private static function action($value)
+    {
+        $value = self::identifier($value);
+        return in_array($value, array('block_all', 'manual_review', 'allow_provider_types'), true) ? $value : '';
+    }
+
+    private static function identifierList(array $values)
+    {
+        $result = array();
+        foreach ($values as $value) {
+            if (!is_scalar($value)) {
+                continue;
+            }
+            $identifier = self::identifier($value, self::MAX_PROVIDER_LENGTH);
+            if ($identifier === '' || in_array($identifier, $result, true)) {
+                continue;
+            }
+            $result[] = $identifier;
+            if (count($result) >= self::MAX_PROVIDER_COUNT) {
+                break;
+            }
+        }
+        return $result;
+    }
+
+    private static function numericValue($value)
+    {
+        return is_numeric($value) ? $value + 0 : null;
+    }
+}
+
 class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
 {
     const PLUGIN_STATUS = self::STATUS_PRODUCTION;
@@ -48,88 +178,17 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
      * @param array<string, mixed>|null $responseBody
      * @return array<string, mixed>
      */
-    private function getApiErrorDetails($responseBody, $fallback, $httpStatus = null)
+    private function getApiErrorDetails($responseBody, $httpStatus = null)
     {
-        $details = array(
-            'message' => $fallback,
-            'code' => '',
-            'requestId' => '',
-            'httpStatus' => $httpStatus,
-            'transactionId' => '',
-            'externalReference' => '',
-            'amount' => null,
-            'currency' => '',
-            'disputeDate' => '',
-            'gatewayStatus' => '',
-            'disputeId' => '',
-            'disputeStatus' => '',
-            'chargebackStatus' => '',
-            'creditNoteId' => '',
-            'creditNoteNumber' => '',
-        );
-
-        if (!is_array($responseBody)) {
-            return $details;
-        }
-
-        foreach (array('message', 'error') as $key) {
-            if (!empty($responseBody[$key]) && is_string($responseBody[$key])) {
-                $details['message'] = $responseBody[$key];
-                break;
-            }
-        }
-
-        foreach (array('code', 'requestId', 'requestID', 'transactionId', 'externalReference', 'currency', 'disputeDate', 'disputeId', 'disputeStatus', 'chargebackStatus', 'creditNoteId', 'creditNoteNumber') as $key) {
-            if (!empty($responseBody[$key]) && is_scalar($responseBody[$key])) {
-                $targetKey = $key === 'requestID' ? 'requestId' : $key;
-                $details[$targetKey] = (string)$responseBody[$key];
-            }
-        }
-        if (!empty($responseBody['status']) && is_scalar($responseBody['status'])) {
-            $details['gatewayStatus'] = (string)$responseBody['status'];
-        }
-        if (isset($responseBody['chargeback']) && is_array($responseBody['chargeback'])) {
-            foreach (array('disputeId', 'disputeStatus', 'chargebackStatus', 'creditNoteId', 'creditNoteNumber') as $key) {
-                if (empty($details[$key]) && !empty($responseBody['chargeback'][$key]) && is_scalar($responseBody['chargeback'][$key])) {
-                    $details[$key] = (string)$responseBody['chargeback'][$key];
-                }
-            }
-            if (empty($details['disputeId']) && !empty($responseBody['chargeback']['id']) && is_scalar($responseBody['chargeback']['id'])) {
-                $details['disputeId'] = (string)$responseBody['chargeback']['id'];
-            }
-            if (empty($details['requestId'])) {
-                foreach (array('requestId', 'requestID') as $key) {
-                    if (!empty($responseBody['chargeback'][$key]) && is_scalar($responseBody['chargeback'][$key])) {
-                        $details['requestId'] = (string)$responseBody['chargeback'][$key];
-                        break;
-                    }
-                }
-            }
-            if (empty($details['disputeStatus']) && !empty($responseBody['chargeback']['status']) && is_scalar($responseBody['chargeback']['status'])) {
-                $details['disputeStatus'] = (string)$responseBody['chargeback']['status'];
-            }
-        }
-
-        if (isset($responseBody['amount']) && is_numeric($responseBody['amount'])) {
-            $details['amount'] = $responseBody['amount'];
-        }
-
-        return $details;
+        return PaymentGatewayAppApiErrorContext::parse($responseBody, $httpStatus);
     }
 
     /**
      * @param array<string, mixed> $details
      */
-    private function formatCustomerApiError($details)
+    private function formatCustomerApiError($details, $fallback)
     {
-        $message = trim((string)$details['message']);
-        if ((string)$details['code'] === 'CHECKOUT_BLOCKED_BY_DISPUTE') {
-            $message = 'Payment cannot be started because an unresolved dispute is being reviewed. Please contact support.';
-        }
-        if (!empty($details['requestId'])) {
-            $message .= ' Request ID: ' . $details['requestId'];
-        }
-        return $message;
+        return PaymentGatewayAppApiErrorContext::customerMessage($details, $fallback);
     }
 
     /**
@@ -137,23 +196,10 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
      */
     private function logGatewayApiError($details)
     {
-        $this->logError('Payment Gateway App API error', array(
-            'httpStatus' => $details['httpStatus'],
-            'code' => $details['code'],
-            'message' => $details['message'],
-            'requestId' => $details['requestId'],
-            'transactionId' => $details['transactionId'],
-            'externalReference' => $details['externalReference'],
-            'amount' => $details['amount'],
-            'currency' => $details['currency'],
-            'disputeDate' => $details['disputeDate'],
-            'gatewayStatus' => $details['gatewayStatus'],
-            'disputeId' => $details['disputeId'],
-            'disputeStatus' => $details['disputeStatus'],
-            'chargebackStatus' => $details['chargebackStatus'],
-            'creditNoteId' => $details['creditNoteId'],
-            'creditNoteNumber' => $details['creditNoteNumber'],
-        ));
+        $context = PaymentGatewayAppApiErrorContext::logContext($details);
+        if ($context) {
+            $this->logError('Payment Gateway App API error', $context);
+        }
     }
 
 
@@ -167,73 +213,6 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
             }
         }
         $this->logOther('Payment Gateway App checkout ' . $stage, $safeContext);
-    }
-
-    private function getApiScalar($responseBody, array $keys)
-    {
-        if (!is_array($responseBody)) {
-            return '';
-        }
-        foreach ($keys as $key) {
-            if (!empty($responseBody[$key]) && is_scalar($responseBody[$key])) {
-                return (string)$responseBody[$key];
-            }
-        }
-        return '';
-    }
-
-    private function getApiRequestId($responseBody)
-    {
-        return $this->getApiScalar($responseBody, array('requestId', 'requestID'));
-    }
-
-    private function formatCustomerApiError($responseBody, $fallback)
-    {
-        $message = trim($this->getApiErrorMessage($responseBody, $fallback));
-        $code = $this->getApiScalar($responseBody, array('code'));
-
-        if ($code === 'CHECKOUT_BLOCKED_BY_DISPUTE') {
-            $message = 'Payment cannot be started because an unresolved dispute is being reviewed. Please contact support.';
-        } elseif ($code === 'CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD') {
-            $message = 'Payment cannot be started because this customer account is under merchant review. Please contact support.';
-        } elseif ($code === 'CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD') {
-            $message = 'Only bank transfer payment methods are available for this account. Please choose an available bank transfer option or contact support.';
-        }
-
-        $requestId = $this->getApiRequestId($responseBody);
-        if ($requestId !== '') {
-            $message .= ' Request ID: ' . $requestId;
-        }
-        return $message;
-    }
-
-    private function logGatewayApiError($responseBody, $httpStatus)
-    {
-        if (!is_array($responseBody)) {
-            return;
-        }
-
-        $context = array(
-            'httpStatus' => $httpStatus,
-            'code' => $this->getApiScalar($responseBody, array('code')),
-            'requestId' => $this->getApiRequestId($responseBody),
-            'transactionId' => $this->getApiScalar($responseBody, array('transactionId')),
-            'externalReference' => $this->getApiScalar($responseBody, array('externalReference')),
-            'customerRiskHoldId' => $this->getApiScalar($responseBody, array('customerRiskHoldId')),
-            'customerRiskAction' => $this->getApiScalar($responseBody, array('customerRiskAction')),
-            'customerRiskReason' => $this->getApiScalar($responseBody, array('customerRiskReason')),
-            'disputeId' => $this->getApiScalar($responseBody, array('disputeId')),
-            'disputeStatus' => $this->getApiScalar($responseBody, array('disputeStatus', 'chargebackStatus')),
-        );
-        $safeContext = array();
-        foreach ($context as $key => $value) {
-            if ($value !== '' && $value !== null) {
-                $safeContext[$key] = $value;
-            }
-        }
-        if (!empty($safeContext)) {
-            $this->logError('Payment Gateway App API error', $safeContext);
-        }
     }
 
     public function _process($invoice, $request, $result)
@@ -308,7 +287,7 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
 
         $responseCode = $response->getStatus();
         $responseBody = json_decode($response->getBody(), true);
-        $responseErrorDetails = $this->getApiErrorDetails($responseBody, 'gateway returned a non-JSON error response', $responseCode);
+        $responseErrorDetails = $this->getApiErrorDetails($responseBody, $responseCode);
         $this->logCheckoutApiExchange('response', array(
             'invoice' => $invoice->public_id,
             'httpStatus' => $responseCode,
@@ -319,7 +298,7 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
         if ($responseCode !== 200) {
             $errorDetails = $responseErrorDetails;
             $this->logGatewayApiError($errorDetails);
-            $errorMessage = $this->formatCustomerApiError($errorDetails);
+            $errorMessage = $this->formatCustomerApiError($errorDetails, 'Payment session creation failed due to an unexpected gateway response.');
             if ($responseCode === 401) {
                 throw new Am_Exception_FatalError("Authentication failed. Please check your API Key configuration.");
             }
@@ -327,9 +306,9 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
         }
 
         if (!isset($responseBody['paymentUrl'])) {
-            $errorDetails = $this->getApiErrorDetails($responseBody, 'missing paymentUrl in response', $responseCode);
+            $errorDetails = $this->getApiErrorDetails($responseBody, $responseCode);
             $this->logGatewayApiError($errorDetails);
-            $result->setFailed('Payment session creation failed. Reason: ' . $this->formatCustomerApiError($errorDetails));
+            $result->setFailed('Payment session creation failed. Reason: ' . $this->formatCustomerApiError($errorDetails, 'missing paymentUrl in response'));
             return;
         }
 
