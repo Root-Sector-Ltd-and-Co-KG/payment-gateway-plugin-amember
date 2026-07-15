@@ -9,13 +9,14 @@
  */
 final class PaymentGatewayAppApiErrorContext
 {
+    const MAX_JSON_LENGTH = 65536;
     const MAX_IDENTIFIER_LENGTH = 128;
     const MAX_PROVIDER_LENGTH = 64;
     const MAX_PROVIDER_COUNT = 20;
 
     public static function parse($responseBody, $httpStatus = null)
     {
-        $data = is_array($responseBody) ? $responseBody : array();
+        $data = self::decodeBody($responseBody);
         $context = array(
             'httpStatus' => is_numeric($httpStatus) ? (int)$httpStatus : null,
             'code' => self::identifier(self::scalar($data, array('code', 'error.code'))),
@@ -33,7 +34,7 @@ final class PaymentGatewayAppApiErrorContext
             'creditNoteNumber' => self::identifier(self::scalar($data, array('creditNoteNumber', 'error.creditNoteNumber', 'chargeback.creditNoteNumber', 'creditNote.number', 'error.chargeback.creditNoteNumber', 'error.creditNote.number'))),
             'customerRiskHoldId' => self::identifier(self::scalar($data, array('customerRiskHoldId', 'customerRiskHold.id', 'error.customerRiskHoldId', 'error.customerRiskHold.id'))),
             'customerRiskAction' => self::action(self::scalar($data, array('customerRiskAction', 'customerRiskHold.action', 'error.customerRiskAction', 'error.customerRiskHold.action'))),
-            'customerRiskReason' => self::identifier(self::scalar($data, array('customerRiskReason', 'customerRiskHold.reason', 'error.customerRiskReason', 'error.customerRiskHold.reason'))),
+            'customerRiskReason' => self::reason(self::scalar($data, array('customerRiskReason', 'customerRiskHold.reason', 'error.customerRiskReason', 'error.customerRiskHold.reason'))),
             'allowedProviderTypes' => self::identifierList(self::arrayValue($data, array('allowedProviderTypes', 'customerRiskHold.allowedProviderTypes', 'error.allowedProviderTypes', 'error.customerRiskHold.allowedProviderTypes'))),
             'allowedProviderIds' => self::identifierList(self::arrayValue($data, array('allowedProviderIds', 'customerRiskHold.allowedProviderIds', 'error.allowedProviderIds', 'error.customerRiskHold.allowedProviderIds'))),
         );
@@ -61,13 +62,15 @@ final class PaymentGatewayAppApiErrorContext
     public static function logContext(array $context, array $extra = array())
     {
         $allowed = array('httpStatus', 'code', 'requestId', 'transactionId', 'externalReference', 'amount', 'currency', 'disputeDate', 'gatewayStatus', 'disputeId', 'disputeStatus', 'chargebackStatus', 'creditNoteId', 'creditNoteNumber', 'customerRiskHoldId', 'customerRiskAction', 'customerRiskReason', 'allowedProviderTypes', 'allowedProviderIds');
+        $result = array();
         foreach ($allowed as $key) {
-            if (!array_key_exists($key, $context) || $context[$key] === '' || $context[$key] === null || $context[$key] === array()) {
+            $value = array_key_exists($key, $context) ? $context[$key] : (array_key_exists($key, $extra) ? $extra[$key] : null);
+            if ($value === '' || $value === null || $value === array()) {
                 continue;
             }
-            $extra[$key] = $context[$key];
+            $result[$key] = $value;
         }
-        return $extra;
+        return $result;
     }
 
     private static function value(array $data, array $paths)
@@ -83,6 +86,18 @@ final class PaymentGatewayAppApiErrorContext
             return $value;
         }
         return null;
+    }
+
+    private static function decodeBody($responseBody)
+    {
+        if (is_array($responseBody)) {
+            return $responseBody;
+        }
+        if (!is_string($responseBody) || $responseBody === '' || strlen($responseBody) > self::MAX_JSON_LENGTH) {
+            return array();
+        }
+        $decoded = json_decode($responseBody, true);
+        return is_array($decoded) ? $decoded : array();
     }
 
     private static function scalar(array $data, array $paths)
@@ -110,6 +125,12 @@ final class PaymentGatewayAppApiErrorContext
     {
         $value = self::identifier($value);
         return in_array($value, array('block_all', 'manual_review', 'allow_provider_types'), true) ? $value : '';
+    }
+
+    private static function reason($value)
+    {
+        $value = self::identifier($value);
+        return in_array($value, array('lost_dispute', 'accepted_dispute'), true) ? $value : '';
     }
 
     private static function identifierList(array $values)
@@ -170,6 +191,9 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
         $form->addAdvCheckbox('pass_items')
             ->setLabel(___("Pass Items\n" .
                 'Send invoice line-items to the payment gateway app.'));
+        $form->addAdvCheckbox('debug_logging')
+            ->setLabel(___("Enable Debug Logging\n" .
+                'Log bounded gateway metadata for troubleshooting. Keep disabled during normal operation.'));
     }
 
     /**
@@ -196,6 +220,9 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
      */
     private function logGatewayApiError($details)
     {
+        if (!$this->isDebugLoggingEnabled()) {
+            return;
+        }
         $context = PaymentGatewayAppApiErrorContext::logContext($details);
         if ($context) {
             $this->logError('Payment Gateway App API error', $context);
@@ -205,14 +232,29 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
 
     private function logCheckoutApiExchange($stage, array $context)
     {
-        $allowed = array('invoice', 'endpoint', 'httpStatus', 'amount', 'currency', 'itemCount', 'hasBillingAddress', 'requestId', 'code', 'message');
+        if (!$this->isDebugLoggingEnabled()) {
+            return;
+        }
+        $allowed = array('invoice', 'endpoint', 'httpStatus', 'amount', 'currency', 'itemCount', 'hasBillingAddress', 'requestId', 'code');
         $safeContext = array();
         foreach ($allowed as $key) {
-            if (array_key_exists($key, $context) && $context[$key] !== '' && $context[$key] !== null) {
-                $safeContext[$key] = $context[$key];
+            if (!array_key_exists($key, $context) || $context[$key] === '' || $context[$key] === null) {
+                continue;
+            }
+            $value = $context[$key];
+            if (is_string($value) && (strlen($value) > 256 || preg_match('/[\x00-\x1F\x7F]/', $value))) {
+                continue;
+            }
+            if (is_scalar($value)) {
+                $safeContext[$key] = $value;
             }
         }
         $this->logOther('Payment Gateway App checkout ' . $stage, $safeContext);
+    }
+
+    private function isDebugLoggingEnabled()
+    {
+        return in_array($this->getConfig('debug_logging'), array(true, 1, '1', 'yes', 'on'), true);
     }
 
     public function _process($invoice, $request, $result)

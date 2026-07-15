@@ -63,12 +63,12 @@ invalid or missing signatures are rejected and logged.
 
 ## Troubleshooting logs
 
-aMember may log payment-session and IPN failures when error reporting is
-enabled. The plugin logs safe gateway metadata such as gateway code, request
-ID, transaction ID, external reference, dispute status, and customer-risk-hold
-fields instead of full checkout request bodies. Avoid verbose logging on
-production unless you are diagnosing an issue, and restrict access to log files
-to trusted administrators.
+The optional **Enable Debug Logging** setting is off by default. When enabled,
+the plugin logs only bounded, allowlisted gateway metadata such as gateway code,
+request ID, transaction ID, external reference, dispute status, and
+customer-risk-hold fields. It never logs response bodies, backend messages,
+credentials, billing data, or customer email addresses. Enable it only while
+diagnosing an issue and restrict access to log files to trusted administrators.
 
 Checkout requests blocked by an unresolved dispute use
 `CHECKOUT_BLOCKED_BY_DISPUTE` and show a customer-safe support message with the
