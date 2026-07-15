@@ -328,8 +328,8 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
         $response = $httpRequest->send();
 
         $responseCode = $response->getStatus();
-        $responseBody = json_decode($response->getBody(), true);
-        $responseErrorDetails = $this->getApiErrorDetails($responseBody, $responseCode);
+        $responseRawBody = $response->getBody();
+        $responseErrorDetails = $this->getApiErrorDetails($responseRawBody, $responseCode);
         $this->logCheckoutApiExchange('response', array(
             'invoice' => $invoice->public_id,
             'httpStatus' => $responseCode,
@@ -347,8 +347,9 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
             throw new Am_Exception_FatalError("Payment session creation failed: " . $errorMessage);
         }
 
+        $responseBody = json_decode($responseRawBody, true);
         if (!isset($responseBody['paymentUrl'])) {
-            $errorDetails = $this->getApiErrorDetails($responseBody, $responseCode);
+            $errorDetails = $responseErrorDetails;
             $this->logGatewayApiError($errorDetails);
             $result->setFailed('Payment session creation failed. Reason: ' . $this->formatCustomerApiError($errorDetails, 'missing paymentUrl in response'));
             return;

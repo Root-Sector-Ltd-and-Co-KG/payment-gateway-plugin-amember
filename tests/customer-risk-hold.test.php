@@ -151,4 +151,19 @@ expectTrue(!str_contains($encodedLogs, 'secret@example.test'), 'Debug logs must 
 expectTrue(!str_contains($encodedLogs, 'Bearer'), 'Debug logs must exclude credentials.');
 expectTrue(strlen($encodedLogs) < 8192, 'Debug log context must remain bounded.');
 
+$oversizedRawJson = json_encode(array(
+    'code' => 'CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD',
+    'requestId' => 'request-must-not-parse',
+    'padding' => str_repeat('x', PaymentGatewayAppApiErrorContext::MAX_JSON_LENGTH),
+));
+Am_HttpRequest::$response = new Am_HttpResponseStub(409, $oversizedRawJson);
+try {
+    $plugin->_process($invoice, null, $result);
+    throw new RuntimeException('Expected oversized gateway error response to fail checkout.');
+} catch (Am_Exception_FatalError $error) {
+    expectTrue(str_contains($error->getMessage(), 'unexpected gateway response'), 'Oversized gateway errors must use the generic fallback.');
+    expectTrue(!str_contains($error->getMessage(), 'merchant review'), 'Oversized gateway errors must not bypass the raw-response bound.');
+    expectTrue(!str_contains($error->getMessage(), 'request-must-not-parse'), 'Oversized gateway errors must not expose unparsed request IDs.');
+}
+
 echo "aMember customer risk hold contract: PASS\n";
