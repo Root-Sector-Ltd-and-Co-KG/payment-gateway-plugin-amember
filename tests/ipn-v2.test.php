@@ -62,6 +62,11 @@ class Am_Paysystem_Transaction_Incoming
     {
         return $this->plugin;
     }
+
+    public function getReceiptId()
+    {
+        return $this->getUniqId();
+    }
 }
 
 class Invoice
@@ -72,7 +77,9 @@ class Invoice
 
 class InvoiceRefund
 {
-    public const CHARGEBACK = 2;
+    public const REFUND = 0;
+    public const CHARGEBACK = 1;
+    public const VOID = 2;
 }
 
 require dirname(__DIR__) . '/payment-gateway-app.php';
@@ -159,6 +166,12 @@ final class FakeAmemberInvoice
     public int $status = 0;
     public array $effects = array();
     public array $trace = array();
+    public int $paymentFailuresRemaining = 0;
+    public int $postEffectRefreshFailuresRemaining = 0;
+    public bool $preservePendingStatusAfterPayment = false;
+    public bool $preservePaidStatusAfterRefund = false;
+    private array $paymentRecords = array();
+    private array $refundRecords = array();
     private FakeAmemberData $data;
 
     public function __construct()
@@ -174,6 +187,10 @@ final class FakeAmemberInvoice
     public function refresh(): void
     {
         $this->trace[] = 'refresh';
+        if ($this->effects && $this->postEffectRefreshFailuresRemaining > 0) {
+            $this->postEffectRefreshFailuresRemaining--;
+            throw new RuntimeException('simulated post-effect refresh failure');
+        }
     }
 
     public function data(): FakeAmemberData
@@ -184,14 +201,30 @@ final class FakeAmemberInvoice
     public function addPayment($transaction): void
     {
         $this->trace[] = 'payment';
+        if ($this->paymentFailuresRemaining > 0) {
+            $this->paymentFailuresRemaining--;
+            throw new RuntimeException('simulated payment effect failure');
+        }
         $this->effects[] = 'payment';
-        $this->status = Invoice::PAID;
+        $this->paymentRecords[] = (object)array(
+            'receipt_id' => $transaction->getReceiptId(),
+            'transaction_id' => $transaction->getUniqId(),
+        );
+        if (!$this->preservePendingStatusAfterPayment) {
+            $this->status = Invoice::PAID;
+        }
     }
 
     public function addVoid($transaction, string $transactionId): void
     {
         $this->trace[] = 'void';
         $this->effects[] = 'void';
+        $this->refundRecords[] = (object)array(
+            'refund_type' => InvoiceRefund::VOID,
+            'receipt_id' => $transaction->getReceiptId(),
+            'transaction_id' => $transaction->getUniqId(),
+            'original_receipt_id' => $transactionId,
+        );
         $this->status = 0;
     }
 
@@ -199,13 +232,27 @@ final class FakeAmemberInvoice
     {
         $this->trace[] = 'refund';
         $this->effects[] = 'refund';
-        $this->status = 0;
+        $this->refundRecords[] = (object)array(
+            'refund_type' => InvoiceRefund::REFUND,
+            'receipt_id' => $transaction->getReceiptId(),
+            'transaction_id' => $transaction->getUniqId(),
+            'original_receipt_id' => $transactionId,
+        );
+        if (!$this->preservePaidStatusAfterRefund) {
+            $this->status = 0;
+        }
     }
 
     public function addChargeback($transaction, string $transactionId): void
     {
         $this->trace[] = 'chargeback';
         $this->effects[] = 'chargeback';
+        $this->refundRecords[] = (object)array(
+            'refund_type' => InvoiceRefund::CHARGEBACK,
+            'receipt_id' => $transaction->getReceiptId(),
+            'transaction_id' => $transaction->getUniqId(),
+            'original_receipt_id' => $transactionId,
+        );
         $this->status = 0;
     }
 
@@ -218,7 +265,30 @@ final class FakeAmemberInvoice
 
     public function getRefundRecords(): array
     {
-        return array();
+        return $this->refundRecords;
+    }
+
+    public function getPaymentRecords(): array
+    {
+        return $this->paymentRecords;
+    }
+
+    public function seedPaymentReceipt(string $receiptId, string $transactionId): void
+    {
+        $this->paymentRecords[] = (object)array(
+            'receipt_id' => $receiptId,
+            'transaction_id' => $transactionId,
+        );
+    }
+
+    public function seedRefundReceipt(int $refundType, string $receiptId, string $transactionId): void
+    {
+        $this->refundRecords[] = (object)array(
+            'refund_type' => $refundType,
+            'receipt_id' => $receiptId,
+            'transaction_id' => $transactionId,
+            'original_receipt_id' => $receiptId,
+        );
     }
 
     public function persistedState(): array
@@ -350,6 +420,297 @@ ipnV2AssertSame(true, $duplicateResult['accepted'], 'An acknowledgement-loss res
 ipnV2AssertSame('OK', $duplicateResult['output'], 'A duplicate v2 resend must receive the normal success body.');
 ipnV2AssertSame(array('payment'), $validInvoice->effects, 'A duplicate v2 resend must not repeat payment effects.');
 
+// A pre-effect claim remains retryable when the payment operation itself fails.
+$recoverableInvoice = new FakeAmemberInvoice();
+$recoverableInvoice->paymentFailuresRemaining = 1;
+$recoverablePayload = v2Payload('delivery-recoverable', 1, 1);
+$failedEffectResult = executeIpn(
+    $plugin,
+    $recoverableInvoice,
+    $recoverablePayload,
+    $now,
+    '2',
+    'delivery-recoverable'
+);
+$recoveredEffectResult = executeIpn(
+    $plugin,
+    $recoverableInvoice,
+    $recoverablePayload,
+    $now + 1,
+    '2',
+    'delivery-recoverable'
+);
+$recoveredDuplicateResult = executeIpn(
+    $plugin,
+    $recoverableInvoice,
+    $recoverablePayload,
+    $now + 2,
+    '2',
+    'delivery-recoverable'
+);
+ipnV2AssertSame(false, $failedEffectResult['accepted'], 'A failed payment effect must not be acknowledged.');
+ipnV2AssertSame(true, $recoveredEffectResult['accepted'], 'The same delivery must remain recoverable after its effect fails.');
+ipnV2AssertSame(true, $recoveredDuplicateResult['accepted'], 'A recovered delivery must remain duplicate-safe.');
+ipnV2AssertSame(
+    array('payment'),
+    $recoverableInvoice->effects,
+    'Recovery must apply the payment exactly once and later retries must not repeat it.'
+);
+
+// A committed aMember effect receipt closes the crash window before receiver state can be marked applied.
+$paymentReceiptInvoice = new FakeAmemberInvoice();
+$paymentReceiptInvoice->preservePendingStatusAfterPayment = true;
+$paymentReceiptInvoice->postEffectRefreshFailuresRemaining = 1;
+$paymentReceiptPayload = v2Payload('delivery-payment-receipt', 1, 1);
+$paymentReceiptFailure = executeIpn(
+    $plugin,
+    $paymentReceiptInvoice,
+    $paymentReceiptPayload,
+    $now,
+    '2',
+    'delivery-payment-receipt'
+);
+$paymentReceiptRedeliveryPayload = $paymentReceiptPayload;
+$paymentReceiptRedeliveryPayload['deliveryId'] = 'delivery-payment-receipt-redelivery';
+$paymentReceiptRecovery = executeIpn(
+    $plugin,
+    $paymentReceiptInvoice,
+    $paymentReceiptRedeliveryPayload,
+    $now + 1,
+    '2',
+    'delivery-payment-receipt-redelivery'
+);
+$paymentReceiptOriginalRetry = executeIpn(
+    $plugin,
+    $paymentReceiptInvoice,
+    $paymentReceiptPayload,
+    $now + 2,
+    '2',
+    'delivery-payment-receipt'
+);
+ipnV2AssertSame(false, $paymentReceiptFailure['accepted'], 'A post-payment state failure must not be acknowledged.');
+ipnV2AssertSame(
+    true,
+    $paymentReceiptRecovery['accepted'],
+    'A committed payment receipt must allow the same event to recover under a replacement delivery ID.'
+);
+ipnV2AssertSame(true, $paymentReceiptOriginalRetry['accepted'], 'The original pending delivery must remain safely recoverable.');
+ipnV2AssertSame(
+    array('payment'),
+    $paymentReceiptInvoice->effects,
+    'Retry after a committed payment receipt must not repeat the payment effect.'
+);
+
+$refundReceiptInvoice = new FakeAmemberInvoice();
+$refundReceiptInvoice->status = Invoice::PAID;
+$refundReceiptInvoice->preservePaidStatusAfterRefund = true;
+$refundReceiptInvoice->postEffectRefreshFailuresRemaining = 1;
+$refundReceiptPayload = v2Payload('delivery-refund-receipt', 1, 3);
+$refundReceiptFailure = executeIpn(
+    $plugin,
+    $refundReceiptInvoice,
+    $refundReceiptPayload,
+    $now,
+    '2',
+    'delivery-refund-receipt'
+);
+$refundReceiptRecovery = executeIpn(
+    $plugin,
+    $refundReceiptInvoice,
+    $refundReceiptPayload,
+    $now + 1,
+    '2',
+    'delivery-refund-receipt'
+);
+ipnV2AssertSame(false, $refundReceiptFailure['accepted'], 'A post-refund state failure must not be acknowledged.');
+ipnV2AssertSame(true, $refundReceiptRecovery['accepted'], 'A committed refund receipt must allow safe state recovery.');
+ipnV2AssertSame(
+    array('refund'),
+    $refundReceiptInvoice->effects,
+    'Retry after a committed refund receipt must not repeat the refund effect.'
+);
+
+$chargebackReceiptInvoice = new FakeAmemberInvoice();
+$chargebackReceiptInvoice->status = Invoice::PAID;
+$chargebackReceiptInvoice->postEffectRefreshFailuresRemaining = 1;
+$chargebackReceiptPayload = v2Payload('delivery-chargeback-receipt', 1, 4);
+$chargebackReceiptFailure = executeIpn(
+    $plugin,
+    $chargebackReceiptInvoice,
+    $chargebackReceiptPayload,
+    $now,
+    '2',
+    'delivery-chargeback-receipt'
+);
+$chargebackReceiptRecovery = executeIpn(
+    $plugin,
+    $chargebackReceiptInvoice,
+    $chargebackReceiptPayload,
+    $now + 1,
+    '2',
+    'delivery-chargeback-receipt'
+);
+ipnV2AssertSame(false, $chargebackReceiptFailure['accepted'], 'A post-chargeback state failure must not be acknowledged.');
+ipnV2AssertSame(true, $chargebackReceiptRecovery['accepted'], 'A committed chargeback receipt must allow safe state recovery.');
+ipnV2AssertSame(
+    array('chargeback'),
+    $chargebackReceiptInvoice->effects,
+    'Retry after a committed chargeback receipt must not repeat the chargeback effect.'
+);
+$chargebackReceiptRecords = $chargebackReceiptInvoice->getRefundRecords();
+ipnV2AssertSame(
+    'transaction-123',
+    $chargebackReceiptRecords[0]->original_receipt_id ?? null,
+    'A v2 chargeback must reconcile to the canonical gateway payment receipt.'
+);
+
+// Replacement deliveries for one transaction/version must preserve the effect semantics claimed first.
+$semanticIdentityInvoice = new FakeAmemberInvoice();
+$semanticIdentityInvoice->postEffectRefreshFailuresRemaining = 1;
+$semanticIdentityPayment = v2Payload('delivery-semantic-payment', 1, 1);
+$semanticIdentityPaymentFailure = executeIpn(
+    $plugin,
+    $semanticIdentityInvoice,
+    $semanticIdentityPayment,
+    $now,
+    '2',
+    'delivery-semantic-payment'
+);
+$semanticIdentityConflict = v2Payload('delivery-semantic-conflict', 1, 2);
+$semanticIdentityConflict['occurredAt'] = '2026-07-26T18:31:00Z';
+$semanticIdentityConflictResult = executeIpn(
+    $plugin,
+    $semanticIdentityInvoice,
+    $semanticIdentityConflict,
+    $now + 1,
+    '2',
+    'delivery-semantic-conflict'
+);
+$semanticIdentityEquivalent = v2Payload('delivery-semantic-equivalent', 1, 1);
+$semanticIdentityEquivalent['occurredAt'] = '2026-07-26T18:32:00Z';
+$semanticIdentityEquivalent['disputeStatus'] = 'lost';
+$semanticIdentityEquivalent['chargeback'] = array('status' => 'accepted');
+$semanticIdentityEquivalentResult = executeIpn(
+    $plugin,
+    $semanticIdentityInvoice,
+    $semanticIdentityEquivalent,
+    $now + 2,
+    '2',
+    'delivery-semantic-equivalent'
+);
+ipnV2AssertSame(false, $semanticIdentityPaymentFailure['accepted'], 'A post-payment state failure must leave its semantic event claim pending.');
+ipnV2AssertSame(
+    false,
+    $semanticIdentityConflictResult['accepted'],
+    'A replacement delivery must be rejected when its status conflicts with the claimed transaction/event version.'
+);
+ipnV2AssertSame(
+    true,
+    $semanticIdentityEquivalentResult['accepted'],
+    'An equivalent replacement delivery may recover despite retry-only field and ignored legacy-alias changes.'
+);
+ipnV2AssertSame(
+    array('payment'),
+    $semanticIdentityInvoice->effects,
+    'A semantic conflict must not apply a void or repeat the committed payment effect.'
+);
+
+// Receipt identity is scoped to each v2 event/effect, so valid state recurrence is not cross-suppressed.
+$paymentRecurrenceInvoice = new FakeAmemberInvoice();
+$paymentRecurrenceSuccessOne = executeIpn(
+    $plugin,
+    $paymentRecurrenceInvoice,
+    v2Payload('delivery-payment-recurrence-1', 1, 1),
+    $now,
+    '2',
+    'delivery-payment-recurrence-1'
+);
+$paymentRecurrenceVoid = executeIpn(
+    $plugin,
+    $paymentRecurrenceInvoice,
+    v2Payload('delivery-payment-recurrence-2', 2, 2),
+    $now + 1,
+    '2',
+    'delivery-payment-recurrence-2'
+);
+$paymentRecurrenceSuccessThree = executeIpn(
+    $plugin,
+    $paymentRecurrenceInvoice,
+    v2Payload('delivery-payment-recurrence-3', 3, 1),
+    $now + 2,
+    '2',
+    'delivery-payment-recurrence-3'
+);
+ipnV2AssertSame(true, $paymentRecurrenceSuccessOne['accepted'], 'The initial successful v2 event must be accepted.');
+ipnV2AssertSame(true, $paymentRecurrenceVoid['accepted'], 'The intervening void v2 event must be accepted.');
+ipnV2AssertSame(true, $paymentRecurrenceSuccessThree['accepted'], 'A newer successful v2 event after a void must be accepted.');
+ipnV2AssertSame(
+    array('payment', 'void', 'payment'),
+    $paymentRecurrenceInvoice->effects,
+    'A v1 success receipt must not suppress the distinct v3 success effect after a v2 void.'
+);
+$paymentRecurrenceRecords = $paymentRecurrenceInvoice->getPaymentRecords();
+ipnV2AssertSame(
+    2,
+    count($paymentRecurrenceRecords),
+    'Each semantically valid recurring payment event must create its own receipt.'
+);
+ipnV2AssertTrue(
+    isset($paymentRecurrenceRecords[0], $paymentRecurrenceRecords[1])
+        && $paymentRecurrenceRecords[0]->transaction_id !== $paymentRecurrenceRecords[1]->transaction_id,
+    'Different v2 payment event versions must not collide in aMember transaction identity.'
+);
+foreach ($paymentRecurrenceRecords as $paymentRecord) {
+    ipnV2AssertSame(
+        'transaction-123',
+        $paymentRecord->receipt_id,
+        'A v2 payment receipt must retain the canonical gateway transaction identity.'
+    );
+    ipnV2AssertTrue(
+        strlen($paymentRecord->transaction_id) <= 64,
+        'A v2 payment transaction identity must fit aMember varchar(64).'
+    );
+}
+
+$refundRecurrenceInvoice = new FakeAmemberInvoice();
+$refundRecurrenceResults = array(
+    executeIpn($plugin, $refundRecurrenceInvoice, v2Payload('delivery-refund-recurrence-1', 1, 1), $now, '2', 'delivery-refund-recurrence-1'),
+    executeIpn($plugin, $refundRecurrenceInvoice, v2Payload('delivery-refund-recurrence-2', 2, 3), $now + 1, '2', 'delivery-refund-recurrence-2'),
+    executeIpn($plugin, $refundRecurrenceInvoice, v2Payload('delivery-refund-recurrence-3', 3, 1), $now + 2, '2', 'delivery-refund-recurrence-3'),
+    executeIpn($plugin, $refundRecurrenceInvoice, v2Payload('delivery-refund-recurrence-4', 4, 3), $now + 3, '2', 'delivery-refund-recurrence-4'),
+);
+foreach ($refundRecurrenceResults as $refundRecurrenceResult) {
+    ipnV2AssertSame(true, $refundRecurrenceResult['accepted'], 'Each ordered recurring payment/refund event must be accepted.');
+}
+ipnV2AssertSame(
+    array('payment', 'refund', 'payment', 'refund'),
+    $refundRecurrenceInvoice->effects,
+    'Distinct recurring v2 payment and refund events must each apply once when the invoice permits recurrence.'
+);
+$refundRecurrenceRecords = $refundRecurrenceInvoice->getRefundRecords();
+ipnV2AssertSame(2, count($refundRecurrenceRecords), 'Each recurring v2 refund event must create its own receipt.');
+ipnV2AssertTrue(
+    isset($refundRecurrenceRecords[0], $refundRecurrenceRecords[1])
+        && $refundRecurrenceRecords[0]->transaction_id !== $refundRecurrenceRecords[1]->transaction_id,
+    'Different v2 refund event versions must not collide in aMember transaction identity.'
+);
+foreach ($refundRecurrenceRecords as $refundRecord) {
+    ipnV2AssertSame(
+        'transaction-123',
+        $refundRecord->receipt_id,
+        'A v2 refund receipt must retain the canonical gateway transaction identity.'
+    );
+    ipnV2AssertSame(
+        'transaction-123',
+        $refundRecord->original_receipt_id,
+        'A v2 refund must reconcile to the canonical gateway payment receipt.'
+    );
+    ipnV2AssertTrue(
+        strlen($refundRecord->transaction_id) <= 64,
+        'A v2 refund transaction identity must fit aMember varchar(64).'
+    );
+}
+
 // A newer successful event wins; an older failed event is acknowledged without voiding it.
 $orderedInvoice = new FakeAmemberInvoice();
 $newerResult = executeIpn($plugin, $orderedInvoice, v2Payload('delivery-newer', 2, 1), $now, '2', 'delivery-newer');
@@ -417,6 +778,74 @@ $schemaMismatch['schemaVersion'] = 1;
 $schemaMismatchResult = executeIpn($plugin, $schemaMismatchInvoice, $schemaMismatch, $now, '2', 'delivery-schema');
 ipnV2AssertSame(false, $schemaMismatchResult['accepted'], 'X-IPN-Version and schemaVersion must both equal v2.');
 
+// V2 ordering identity is the canonical typed top-level id, never a legacy alias.
+$missingIdInvoice = new FakeAmemberInvoice();
+$missingId = v2Payload('delivery-missing-id', 10);
+unset($missingId['id']);
+$missingId['transactionId'] = 'legacy-alias-one';
+$missingIdResult = executeIpn($plugin, $missingIdInvoice, $missingId, $now, '2', 'delivery-missing-id');
+
+$wrongId = v2Payload('delivery-wrong-id', 11);
+$wrongId['id'] = 123;
+$wrongId['transactionId'] = 'legacy-alias-two';
+$wrongIdResult = executeIpn($plugin, $missingIdInvoice, $wrongId, $now, '2', 'delivery-wrong-id');
+
+$oversizedId = v2Payload('delivery-oversized-id', 12);
+$oversizedId['id'] = str_repeat('x', 65);
+$oversizedIdResult = executeIpn(
+    $plugin,
+    $missingIdInvoice,
+    $oversizedId,
+    $now,
+    '2',
+    'delivery-oversized-id'
+);
+
+$canonicalAfterAliases = v2Payload('delivery-canonical-after-aliases', 1);
+$canonicalAfterAliases['id'] = 'canonical-transaction';
+$canonicalAfterAliasesResult = executeIpn(
+    $plugin,
+    $missingIdInvoice,
+    $canonicalAfterAliases,
+    $now,
+    '2',
+    'delivery-canonical-after-aliases'
+);
+ipnV2AssertSame(false, $missingIdResult['accepted'], 'A v2 transaction with only a legacy ID alias must be rejected.');
+ipnV2AssertSame(false, $wrongIdResult['accepted'], 'A v2 transaction with a non-string top-level id must be rejected.');
+ipnV2AssertSame(
+    false,
+    $oversizedIdResult['accepted'],
+    'A v2 transaction ID that cannot fit aMember receipt_id varchar(64) must be rejected.'
+);
+ipnV2AssertSame(
+    true,
+    $canonicalAfterAliasesResult['accepted'],
+    'Rejected alias-only transactions must not cross-suppress a canonical lower event version.'
+);
+ipnV2AssertSame(
+    array('payment'),
+    $missingIdInvoice->effects,
+    'Invalid v2 IDs must not cause effects or advance ordering state.'
+);
+
+// Legacy dispute aliases in a v2 envelope cannot override the canonical integer status.
+$hybridInvoice = new FakeAmemberInvoice();
+$hybridPayload = v2Payload('delivery-hybrid', 1, 1);
+$hybridPayload['disputeStatus'] = 'lost';
+$hybridPayload['chargebackStatus'] = 'accepted';
+$hybridPayload['chargeback'] = array(
+    'status' => 'open',
+    'transactionId' => 'legacy-chargeback-alias',
+);
+$hybridResult = executeIpn($plugin, $hybridInvoice, $hybridPayload, $now, '2', 'delivery-hybrid');
+ipnV2AssertSame(true, $hybridResult['accepted'], 'A valid v2 status remains authoritative in a hybrid payload.');
+ipnV2AssertSame(
+    array('payment'),
+    $hybridInvoice->effects,
+    'Legacy dispute aliases must not turn a successful v2 status into a chargeback effect.'
+);
+
 // The bounded migration path still accepts the existing signed v1 shape.
 $v1Invoice = new FakeAmemberInvoice();
 $v1Result = executeIpn(
@@ -430,6 +859,46 @@ $v1Result = executeIpn(
 ipnV2AssertSame(true, $v1Result['accepted'], 'A correctly signed legacy v1 request must remain accepted.');
 ipnV2AssertSame(array('payment'), $v1Invoice->effects, 'The retained v1 path must preserve payment behavior.');
 ipnV2AssertSame(array(), $v1Invoice->persistedState(), 'The v1 compatibility path must remain isolated from v2 state.');
+
+// V2 receipt reconciliation must not add receipt-based suppression to legacy v1 effects.
+$v1PaymentCompatibilityInvoice = new FakeAmemberInvoice();
+$v1PaymentCompatibilityInvoice->seedPaymentReceipt('transaction-v1-payment', 'transaction-v1-payment');
+$v1PaymentCompatibilityResult = executeIpn(
+    $plugin,
+    $v1PaymentCompatibilityInvoice,
+    array('id' => 'transaction-v1-payment', 'externalReference' => 'invoice-42', 'status' => 1),
+    $now,
+    null,
+    null
+);
+ipnV2AssertSame(true, $v1PaymentCompatibilityResult['accepted'], 'A legacy v1 payment remains accepted.');
+ipnV2AssertSame(
+    array('payment'),
+    $v1PaymentCompatibilityInvoice->effects,
+    'A pre-existing receipt must not change the legacy v1 payment effect gate.'
+);
+
+$v1RefundCompatibilityInvoice = new FakeAmemberInvoice();
+$v1RefundCompatibilityInvoice->status = Invoice::PAID;
+$v1RefundCompatibilityInvoice->seedRefundReceipt(
+    InvoiceRefund::REFUND,
+    'transaction-v1-refund',
+    'transaction-v1-refund'
+);
+$v1RefundCompatibilityResult = executeIpn(
+    $plugin,
+    $v1RefundCompatibilityInvoice,
+    array('id' => 'transaction-v1-refund', 'externalReference' => 'invoice-42', 'status' => 3),
+    $now,
+    null,
+    null
+);
+ipnV2AssertSame(true, $v1RefundCompatibilityResult['accepted'], 'A legacy v1 refund remains accepted.');
+ipnV2AssertSame(
+    array('refund'),
+    $v1RefundCompatibilityInvoice->effects,
+    'A pre-existing receipt must not change the legacy v1 refund effect gate.'
+);
 
 if ($failures) {
     fwrite(STDERR, implode("\n", $failures) . "\n");

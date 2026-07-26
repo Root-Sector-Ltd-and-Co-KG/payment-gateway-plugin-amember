@@ -384,7 +384,7 @@ final class PaymentGatewayAppIpnV2State
     const MAX_RETAINED_DELIVERIES = 100;
     const LOCK_WAIT_SECONDS = 5;
 
-    public static function process($invoice, $db, array $payload, $rawBody, callable $applyEffect)
+    public static function process($invoice, $db, $transactionId, array $payload, $rawBody, callable $applyEffect)
     {
         $lockName = 'pgw-ipn-v2:' . substr(hash('sha256', (string)$invoice->pk()), 0, 48);
         $lockAcquired = $db->selectCell('SELECT GET_LOCK(?, ?d)', $lockName, self::LOCK_WAIT_SECONDS);
@@ -396,9 +396,12 @@ final class PaymentGatewayAppIpnV2State
             $invoice->refresh();
             $state = self::loadState($invoice->data()->get(self::STATE_DATA_KEY));
             $deliveryKey = hash('sha256', (string)$payload['deliveryId']);
-            $transactionKey = hash('sha256', (string)$payload['id']);
+            $transactionKey = hash('sha256', (string)$transactionId);
             $eventVersion = (int)$payload['eventVersion'];
             $bodyHash = hash('sha256', (string)$rawBody);
+            $semanticHash = self::semanticEventHash($payload);
+            $delivery = null;
+            $phase = null;
 
             if (isset($state['deliveries'][$deliveryKey])) {
                 $delivery = $state['deliveries'][$deliveryKey];
@@ -410,26 +413,99 @@ final class PaymentGatewayAppIpnV2State
                 ) {
                     throw new Am_Exception_Paysystem('Conflicting IPN v2 delivery identity');
                 }
-                return 'duplicate';
+                $phase = isset($delivery['phase']) ? (string)$delivery['phase'] : 'pending';
             }
 
             $highestEventVersion = isset($state['highestEventVersions'][$transactionKey])
                 ? (int)$state['highestEventVersions'][$transactionKey]
                 : 0;
-            if ($eventVersion <= $highestEventVersion) {
+            if (
+                isset($state['eventSemanticHashes'][$transactionKey])
+                && !is_array($state['eventSemanticHashes'][$transactionKey])
+            ) {
+                throw new Am_Exception_Paysystem('Invalid persisted IPN v2 event semantics');
+            }
+            $eventVersionKey = (string)$eventVersion;
+            $storedSemanticHash = isset($state['eventSemanticHashes'][$transactionKey][$eventVersionKey])
+                ? $state['eventSemanticHashes'][$transactionKey][$eventVersionKey]
+                : null;
+            if ($storedSemanticHash !== null) {
+                if (!is_string($storedSemanticHash) || strlen($storedSemanticHash) !== 64) {
+                    throw new Am_Exception_Paysystem('Invalid persisted IPN v2 event semantics');
+                }
+                if (!hash_equals($storedSemanticHash, $semanticHash)) {
+                    throw new Am_Exception_Paysystem('Conflicting IPN v2 event semantics');
+                }
+            } elseif ($delivery === null) {
+                foreach ($state['deliveries'] as $knownDelivery) {
+                    if (
+                        isset($knownDelivery['transactionKey'], $knownDelivery['eventVersion'])
+                        && hash_equals((string)$knownDelivery['transactionKey'], $transactionKey)
+                        && (int)$knownDelivery['eventVersion'] === $eventVersion
+                    ) {
+                        throw new Am_Exception_Paysystem('Missing persisted IPN v2 event semantics');
+                    }
+                }
+            }
+            if ($delivery === null && $eventVersion <= $highestEventVersion) {
                 return 'outdated';
             }
+            if ($storedSemanticHash === null) {
+                if (!isset($state['eventSemanticHashes'][$transactionKey])) {
+                    $state['eventSemanticHashes'][$transactionKey] = array();
+                }
+                $state['eventSemanticHashes'][$transactionKey][$eventVersionKey] = $semanticHash;
+            }
 
-            $state['highestEventVersions'][$transactionKey] = $eventVersion;
-            $state['deliveries'][$deliveryKey] = array(
-                'transactionKey' => $transactionKey,
-                'eventVersion' => $eventVersion,
-                'bodyHash' => $bodyHash,
-            );
-            $state = self::trimDeliveries($state);
-            self::saveState($invoice, $state);
+            if ($delivery !== null) {
+                if ($phase === 'applied') {
+                    if ($storedSemanticHash === null) {
+                        self::saveState($invoice, $state);
+                    }
+                    return 'duplicate';
+                }
+                if ($phase === 'superseded') {
+                    if ($storedSemanticHash === null) {
+                        self::saveState($invoice, $state);
+                    }
+                    return 'outdated';
+                }
+                if ($phase !== 'pending') {
+                    throw new Am_Exception_Paysystem('Invalid IPN v2 delivery phase');
+                }
+            }
+
+            if ($delivery !== null && $eventVersion < $highestEventVersion) {
+                $state['deliveries'][$deliveryKey]['phase'] = 'superseded';
+                self::saveState($invoice, $state);
+                return 'outdated';
+            }
+            if ($delivery === null) {
+                $state['deliveries'][$deliveryKey] = array(
+                    'transactionKey' => $transactionKey,
+                    'eventVersion' => $eventVersion,
+                    'bodyHash' => $bodyHash,
+                    'phase' => 'pending',
+                );
+                $state = self::trimDeliveries($state);
+                self::saveState($invoice, $state);
+            } elseif ($storedSemanticHash === null) {
+                self::saveState($invoice, $state);
+            }
 
             $applyEffect();
+
+            $invoice->refresh();
+            $state = self::loadState($invoice->data()->get(self::STATE_DATA_KEY));
+            if (!isset($state['deliveries'][$deliveryKey])) {
+                throw new Am_Exception_Paysystem('IPN v2 delivery state disappeared');
+            }
+            $state['deliveries'][$deliveryKey]['phase'] = 'applied';
+            $state['highestEventVersions'][$transactionKey] = max(
+                $highestEventVersion,
+                $eventVersion
+            );
+            self::saveState($invoice, $state);
             return 'applied';
         } finally {
             $db->selectCell('SELECT RELEASE_LOCK(?)', $lockName);
@@ -442,6 +518,7 @@ final class PaymentGatewayAppIpnV2State
             return array(
                 'formatVersion' => self::STATE_FORMAT_VERSION,
                 'highestEventVersions' => array(),
+                'eventSemanticHashes' => array(),
                 'deliveries' => array(),
             );
         }
@@ -456,7 +533,22 @@ final class PaymentGatewayAppIpnV2State
         ) {
             throw new Am_Exception_Paysystem('Invalid persisted IPN v2 state');
         }
+        if (!isset($state['eventSemanticHashes'])) {
+            $state['eventSemanticHashes'] = array();
+        }
+        if (!is_array($state['eventSemanticHashes'])) {
+            throw new Am_Exception_Paysystem('Invalid persisted IPN v2 event semantics');
+        }
         return $state;
+    }
+
+    private static function semanticEventHash(array $payload)
+    {
+        // V2 effect selection is entirely status-driven; retry metadata and legacy dispute aliases are inert.
+        return hash(
+            'sha256',
+            "payment-gateway-app-ipn-v2-semantic-v1\0status\0" . (string)$payload['status']
+        );
     }
 
     private static function saveState($invoice, array $state)
@@ -529,7 +621,44 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     private function getGatewayTransactionId()
     {
+        if ($this->ipnVersion === 2) {
+            return isset($this->parsedRequest['id']) && is_string($this->parsedRequest['id'])
+                ? $this->parsedRequest['id']
+                : '';
+        }
         return $this->getParsedScalar(array('id', 'transactionId', 'chargeback.transactionId', 'chargeback.gatewayTransactionId'));
+    }
+
+    private function getV2ReceiptEffect()
+    {
+        $status = isset($this->parsedRequest['status']) && is_int($this->parsedRequest['status'])
+            ? $this->parsedRequest['status']
+            : null;
+        $effects = array(
+            -2 => 'cancel',
+            -1 => 'initiated',
+            0 => 'pending',
+            1 => 'payment',
+            2 => 'void',
+            3 => 'refund',
+            4 => 'chargeback',
+        );
+        return isset($effects[$status]) ? $effects[$status] : 'invalid';
+    }
+
+    private function getV2ReceiptTransactionId()
+    {
+        $transactionId = $this->getGatewayTransactionId();
+        $eventVersion = isset($this->parsedRequest['eventVersion'])
+            ? (int)$this->parsedRequest['eventVersion']
+            : 0;
+        return hash(
+            'sha256',
+            "payment-gateway-app-ipn-v2\0"
+                . strlen($transactionId) . ':' . $transactionId . "\0"
+                . $eventVersion . "\0"
+                . $this->getV2ReceiptEffect()
+        );
     }
 
     private function getExternalReference()
@@ -571,12 +700,31 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     private function hasExistingChargeback()
     {
+        return $this->hasExistingRefundReceipt(InvoiceRefund::CHARGEBACK);
+    }
+
+    private function hasExistingPaymentReceipt()
+    {
+        $transactionId = (string)$this->getUniqId();
+        foreach ($this->invoice->getPaymentRecords() as $payment) {
+            if ((string)$payment->transaction_id === $transactionId) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function hasExistingRefundReceipt($refundType)
+    {
         if (!isset($this->invoice)) {
             return false;
         }
         $transactionId = (string)$this->getUniqId();
         foreach ($this->invoice->getRefundRecords() as $refund) {
-            if ((int)$refund->refund_type === InvoiceRefund::CHARGEBACK && (string)$refund->transaction_id === $transactionId) {
+            if (
+                (int)$refund->refund_type === (int)$refundType
+                && (string)$refund->transaction_id === $transactionId
+            ) {
                 return true;
             }
         }
@@ -588,19 +736,19 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
         if ($this->hasExistingChargeback()) {
             $this->getPlugin()->logOther('Payment Gateway App chargeback IPN already recorded', array(
                 'invoice' => $this->invoice->public_id,
-                'gatewayTransactionId' => $this->getUniqId(),
+                'gatewayTransactionId' => $this->getGatewayTransactionId(),
                 'requestId' => $this->getRequestId(),
             ));
             return;
         }
 
         try {
-            $this->invoice->addChargeback($this, $this->getUniqId());
+            $this->invoice->addChargeback($this, $this->getReceiptId());
         } catch (Exception $e) {
             if ($this->hasExistingChargeback()) {
                 $this->getPlugin()->logOther('Payment Gateway App duplicate chargeback IPN accepted', array(
                     'invoice' => $this->invoice->public_id,
-                    'gatewayTransactionId' => $this->getUniqId(),
+                    'gatewayTransactionId' => $this->getGatewayTransactionId(),
                     'requestId' => $this->getRequestId(),
                 ));
                 return;
@@ -683,12 +831,22 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
         if ($versionHeader !== '2') {
             $this->rejectV2Envelope('unsupported_version');
         }
+        $this->ipnVersion = 2;
         if (
             !isset($this->parsedRequest['schemaVersion'])
             || !is_int($this->parsedRequest['schemaVersion'])
             || $this->parsedRequest['schemaVersion'] !== 2
         ) {
             $this->rejectV2Envelope('schema_version');
+        }
+        if (
+            !isset($this->parsedRequest['id'])
+            || !is_string($this->parsedRequest['id'])
+            || trim($this->parsedRequest['id']) === ''
+            || strlen($this->parsedRequest['id']) > 64
+            || preg_match('/[\x00-\x1F\x7F]/', $this->parsedRequest['id']) === 1
+        ) {
+            $this->rejectV2Envelope('transaction_identity');
         }
 
         $deliveryId = isset($this->parsedRequest['deliveryId']) ? $this->parsedRequest['deliveryId'] : null;
@@ -713,8 +871,6 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
         ) {
             $this->rejectV2Envelope('occurred_at');
         }
-
-        $this->ipnVersion = 2;
     }
 
     public function validateSource()
@@ -814,7 +970,14 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     public function getUniqId()
     {
-        return $this->getGatewayTransactionId(); // Use the main transaction ID
+        return $this->ipnVersion === 2
+            ? $this->getV2ReceiptTransactionId()
+            : $this->getGatewayTransactionId();
+    }
+
+    public function getReceiptId()
+    {
+        return $this->getGatewayTransactionId();
     }
 
     public function processValidated()
@@ -823,6 +986,7 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
             PaymentGatewayAppIpnV2State::process(
                 $this->invoice,
                 $this->getPlugin()->getDi()->db,
+                $this->getGatewayTransactionId(),
                 $this->parsedRequest,
                 $this->rawRequestBody,
                 function () {
@@ -845,7 +1009,7 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
         $status = isset($this->parsedRequest['status']) && is_numeric($this->parsedRequest['status'])
             ? (int)$this->parsedRequest['status']
             : null;
-        $disputeStatus = $this->getDisputeStatus();
+        $disputeStatus = $this->ipnVersion === 2 ? '' : $this->getDisputeStatus();
         if ($this->isSupportedDisputeStatus($disputeStatus)) {
             $this->logDisputeUpdate($disputeStatus);
             if ($disputeStatus !== 'won') {
@@ -860,18 +1024,27 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
                 // do nothing for pending/initiated
                 break;
             case 1: // successful
-                if ($this->invoice->status != Invoice::PAID) {
+                if (
+                    $this->invoice->status != Invoice::PAID
+                    && ($this->ipnVersion !== 2 || !$this->hasExistingPaymentReceipt())
+                ) {
                     $this->invoice->addPayment($this);
                 }
                 break;
             case 2: // failed
-                if ($this->invoice->status == Invoice::PAID) {
-                    $this->invoice->addVoid($this, $this->getUniqId());
+                if (
+                    $this->invoice->status == Invoice::PAID
+                    && ($this->ipnVersion !== 2 || !$this->hasExistingRefundReceipt(InvoiceRefund::VOID))
+                ) {
+                    $this->invoice->addVoid($this, $this->getReceiptId());
                 }
                 break;
             case 3: // refunded
-                if ($this->invoice->status == Invoice::PAID) {
-                    $this->invoice->addRefund($this, $this->getUniqId());
+                if (
+                    $this->invoice->status == Invoice::PAID
+                    && ($this->ipnVersion !== 2 || !$this->hasExistingRefundReceipt(InvoiceRefund::REFUND))
+                ) {
+                    $this->invoice->addRefund($this, $this->getReceiptId());
                 }
                 break;
             case 4: // chargeback
