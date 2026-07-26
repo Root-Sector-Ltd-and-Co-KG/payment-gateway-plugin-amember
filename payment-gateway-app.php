@@ -377,9 +377,116 @@ class Am_Paysystem_Transaction_PaymentGatewayApp_Thanks extends Am_Paysystem_Tra
     }
 }
 
+final class PaymentGatewayAppIpnV2State
+{
+    const STATE_FORMAT_VERSION = 1;
+    const STATE_DATA_KEY = 'payment_gateway_app_ipn_v2';
+    const MAX_RETAINED_DELIVERIES = 100;
+    const LOCK_WAIT_SECONDS = 5;
+
+    public static function process($invoice, $db, array $payload, $rawBody, callable $applyEffect)
+    {
+        $lockName = 'pgw-ipn-v2:' . substr(hash('sha256', (string)$invoice->pk()), 0, 48);
+        $lockAcquired = $db->selectCell('SELECT GET_LOCK(?, ?d)', $lockName, self::LOCK_WAIT_SECONDS);
+        if ((int)$lockAcquired !== 1) {
+            throw new Am_Exception_Paysystem('Unable to lock IPN v2 state');
+        }
+
+        try {
+            $invoice->refresh();
+            $state = self::loadState($invoice->data()->get(self::STATE_DATA_KEY));
+            $deliveryKey = hash('sha256', (string)$payload['deliveryId']);
+            $transactionKey = hash('sha256', (string)$payload['id']);
+            $eventVersion = (int)$payload['eventVersion'];
+            $bodyHash = hash('sha256', (string)$rawBody);
+
+            if (isset($state['deliveries'][$deliveryKey])) {
+                $delivery = $state['deliveries'][$deliveryKey];
+                if (
+                    !isset($delivery['transactionKey'], $delivery['eventVersion'], $delivery['bodyHash'])
+                    || !hash_equals((string)$delivery['transactionKey'], $transactionKey)
+                    || (int)$delivery['eventVersion'] !== $eventVersion
+                    || !hash_equals((string)$delivery['bodyHash'], $bodyHash)
+                ) {
+                    throw new Am_Exception_Paysystem('Conflicting IPN v2 delivery identity');
+                }
+                return 'duplicate';
+            }
+
+            $highestEventVersion = isset($state['highestEventVersions'][$transactionKey])
+                ? (int)$state['highestEventVersions'][$transactionKey]
+                : 0;
+            if ($eventVersion <= $highestEventVersion) {
+                return 'outdated';
+            }
+
+            $state['highestEventVersions'][$transactionKey] = $eventVersion;
+            $state['deliveries'][$deliveryKey] = array(
+                'transactionKey' => $transactionKey,
+                'eventVersion' => $eventVersion,
+                'bodyHash' => $bodyHash,
+            );
+            $state = self::trimDeliveries($state);
+            self::saveState($invoice, $state);
+
+            $applyEffect();
+            return 'applied';
+        } finally {
+            $db->selectCell('SELECT RELEASE_LOCK(?)', $lockName);
+        }
+    }
+
+    private static function loadState($storedState)
+    {
+        if ($storedState === null || $storedState === '') {
+            return array(
+                'formatVersion' => self::STATE_FORMAT_VERSION,
+                'highestEventVersions' => array(),
+                'deliveries' => array(),
+            );
+        }
+
+        $state = is_string($storedState) ? json_decode($storedState, true) : null;
+        if (
+            !is_array($state)
+            || !isset($state['formatVersion'], $state['highestEventVersions'], $state['deliveries'])
+            || (int)$state['formatVersion'] !== self::STATE_FORMAT_VERSION
+            || !is_array($state['highestEventVersions'])
+            || !is_array($state['deliveries'])
+        ) {
+            throw new Am_Exception_Paysystem('Invalid persisted IPN v2 state');
+        }
+        return $state;
+    }
+
+    private static function saveState($invoice, array $state)
+    {
+        $encoded = json_encode($state);
+        if (!is_string($encoded)) {
+            throw new Am_Exception_Paysystem('Unable to encode IPN v2 state');
+        }
+        $invoice->data()->set(self::STATE_DATA_KEY, $encoded);
+        $invoice->data()->update();
+    }
+
+    private static function trimDeliveries(array $state)
+    {
+        while (count($state['deliveries']) > self::MAX_RETAINED_DELIVERIES) {
+            $deliveryKey = array_key_first($state['deliveries']);
+            if ($deliveryKey === null) {
+                break;
+            }
+            unset($state['deliveries'][$deliveryKey]);
+        }
+        return $state;
+    }
+}
+
 class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transaction_Incoming
 {
     protected $parsedRequest;
+    private $rawRequestBody = '';
+    private $ipnVersion = 1;
 
     private function getParsedScalar(array $keys)
     {
@@ -502,9 +609,118 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
         }
     }
 
+    private function rejectV2Envelope($reason)
+    {
+        $this->getPlugin()->logError(
+            'IPN: Invalid v2 envelope.',
+            $this->getSafeWebhookLogContext(array('reason' => (string)$reason))
+        );
+        throw new Am_Exception_Paysystem('Invalid IPN v2 envelope');
+    }
+
+    private function isValidOpaqueDeliveryId($value)
+    {
+        return is_string($value)
+            && $value !== ''
+            && strlen($value) <= 128
+            && preg_match('/[\x00-\x1F\x7F]/', $value) !== 1;
+    }
+
+    private function isValidOccurredAt($value)
+    {
+        if (!is_string($value) || strlen($value) > 64) {
+            return false;
+        }
+        if (!preg_match(
+            '/\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))\z/',
+            $value,
+            $parts
+        )) {
+            return false;
+        }
+
+        $year = (int)$parts[1];
+        $month = (int)$parts[2];
+        $day = (int)$parts[3];
+        $hour = (int)$parts[4];
+        $minute = (int)$parts[5];
+        $second = (int)$parts[6];
+        $offsetHour = isset($parts[7]) && $parts[7] !== '' ? (int)$parts[7] : 0;
+        $offsetMinute = isset($parts[8]) && $parts[8] !== '' ? (int)$parts[8] : 0;
+
+        return checkdate($month, $day, $year)
+            && $hour <= 23
+            && $minute <= 59
+            && $second <= 59
+            && $offsetHour <= 23
+            && $offsetMinute <= 59;
+    }
+
+    private function validateIpnVersion()
+    {
+        $versionHeader = $this->request->getHeader('X-IPN-Version');
+        $versionHeader = is_scalar($versionHeader) ? trim((string)$versionHeader) : '';
+
+        if ($versionHeader === '') {
+            if (array_key_exists('schemaVersion', $this->parsedRequest)) {
+                $this->rejectV2Envelope('version_mismatch');
+            }
+            $this->ipnVersion = 1;
+            return;
+        }
+
+        if ($versionHeader === '1') {
+            if (
+                array_key_exists('schemaVersion', $this->parsedRequest)
+                && (!is_int($this->parsedRequest['schemaVersion']) || $this->parsedRequest['schemaVersion'] !== 1)
+            ) {
+                $this->rejectV2Envelope('version_mismatch');
+            }
+            $this->ipnVersion = 1;
+            return;
+        }
+
+        if ($versionHeader !== '2') {
+            $this->rejectV2Envelope('unsupported_version');
+        }
+        if (
+            !isset($this->parsedRequest['schemaVersion'])
+            || !is_int($this->parsedRequest['schemaVersion'])
+            || $this->parsedRequest['schemaVersion'] !== 2
+        ) {
+            $this->rejectV2Envelope('schema_version');
+        }
+
+        $deliveryId = isset($this->parsedRequest['deliveryId']) ? $this->parsedRequest['deliveryId'] : null;
+        $headerDeliveryId = $this->request->getHeader('X-IPN-Delivery-ID');
+        if (
+            !$this->isValidOpaqueDeliveryId($deliveryId)
+            || !$this->isValidOpaqueDeliveryId($headerDeliveryId)
+            || !hash_equals($deliveryId, $headerDeliveryId)
+        ) {
+            $this->rejectV2Envelope('delivery_identity');
+        }
+        if (
+            !isset($this->parsedRequest['eventVersion'])
+            || !is_int($this->parsedRequest['eventVersion'])
+            || $this->parsedRequest['eventVersion'] <= 0
+        ) {
+            $this->rejectV2Envelope('event_version');
+        }
+        if (
+            !isset($this->parsedRequest['occurredAt'])
+            || !$this->isValidOccurredAt($this->parsedRequest['occurredAt'])
+        ) {
+            $this->rejectV2Envelope('occurred_at');
+        }
+
+        $this->ipnVersion = 2;
+    }
+
     public function validateSource()
     {
         $raw_body = $this->request->getRawBody();
+        $this->rawRequestBody = $raw_body;
         $this->parsedRequest = json_decode($raw_body, true);
 
         if (json_last_error() !== JSON_ERROR_NONE || !is_array($this->parsedRequest)) {
@@ -547,6 +763,8 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
             return false;
         }
 
+        $this->validateIpnVersion();
+
         $hasDisputeStatus = $this->isSupportedDisputeStatus($this->getDisputeStatus());
         if ($this->getGatewayTransactionId() === '' || $this->getExternalReference() === '' || (!isset($this->parsedRequest['status']) && !$hasDisputeStatus)) {
             $this->getPlugin()->logError("IPN: Missing required fields.", $this->getSafeWebhookLogContext(array('reason' => 'missing_required_fields')));
@@ -563,6 +781,20 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     public function validateStatus()
     {
+        if ($this->ipnVersion === 2) {
+            if (
+                !isset($this->parsedRequest['status'])
+                || !is_int($this->parsedRequest['status'])
+                || !in_array($this->parsedRequest['status'], array(-2, -1, 0, 1, 2, 3, 4), true)
+            ) {
+                $this->getPlugin()->logError(
+                    'IPN: Invalid v2 status field.',
+                    $this->getSafeWebhookLogContext(array('reason' => 'invalid_status_field'))
+                );
+                return false;
+            }
+            return true;
+        }
         if ($this->isSupportedDisputeStatus($this->getDisputeStatus())) {
             return true;
         }
@@ -587,6 +819,29 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     public function processValidated()
     {
+        if ($this->ipnVersion === 2) {
+            PaymentGatewayAppIpnV2State::process(
+                $this->invoice,
+                $this->getPlugin()->getDi()->db,
+                $this->parsedRequest,
+                $this->rawRequestBody,
+                function () {
+                    $this->applyPaymentEffect();
+                }
+            );
+            echo "OK";
+            http_response_code(200);
+            return;
+        }
+
+        $this->applyPaymentEffect();
+        // Send HTTP 200 response with "OK" body
+        echo "OK";
+        http_response_code(200);
+    }
+
+    private function applyPaymentEffect()
+    {
         $status = isset($this->parsedRequest['status']) && is_numeric($this->parsedRequest['status'])
             ? (int)$this->parsedRequest['status']
             : null;
@@ -596,8 +851,6 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
             if ($disputeStatus !== 'won') {
                 $this->addChargebackIdempotently();
             }
-            echo "OK";
-            http_response_code(200);
             return;
         }
 
@@ -636,8 +889,5 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
                 // Do nothing for other statuses
                 break;
         }
-        // Send HTTP 200 response with "OK" body
-        echo "OK";
-        http_response_code(200);
     }
 }
