@@ -61,6 +61,15 @@ request to this URL. Each request includes two signature headers:
 The plugin verifies both headers before processing. Requests with
 invalid or missing signatures are rejected and logged.
 
+Version 1.2.0 adds the IPN v2 receiver used by durable gateway delivery. IPN
+v2 requests include `X-IPN-Version: 2`, `X-IPN-Delivery-ID`, and a signed
+envelope with stable delivery and event identities. Install 1.2.0 before
+enabling IPN v2 for the site. Existing IPN v1 requests remain supported during
+the published migration window, so this plugin can still receive notifications
+from Payment Gateway versions that have not enabled v2. Do not downgrade the
+plugin after enabling v2; the future IPN v1 cutoff and removal release will be
+announced separately.
+
 ## Troubleshooting logs
 
 aMember may log payment-session and IPN failures when error reporting is
@@ -103,6 +112,13 @@ regenerate it in Payment Gateway App admin -> Sites -> Edit and update
 the value in the aMember plugin settings.
 
 ## Changelog
+
+### 1.2.0
+
+- Enhancement: Add canonical signed IPN v2 envelope validation and durable duplicate/out-of-order delivery handling.
+- Reliability: Recover payment, void, refund, and chargeback effects without duplicating aMember receipts after retries.
+- Migration: Retain IPN v1 compatibility during the published migration window; install this release before enabling IPN v2.
+- CI: Execute the complete IPN v2 receiver regression before packaging a release.
 
 ### 1.1.1
 
