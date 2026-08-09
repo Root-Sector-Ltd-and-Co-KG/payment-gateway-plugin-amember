@@ -133,8 +133,6 @@ final class FakeAmemberData
 {
     private array $values = array();
     private array $trace;
-    private ?string $interleavedReadKey = null;
-    private $afterInterleavedRead = null;
 
     public function __construct(array &$trace)
     {
@@ -143,14 +141,7 @@ final class FakeAmemberData
 
     public function get(string $name)
     {
-        $value = $this->values[$name] ?? null;
-        if ($this->interleavedReadKey === $name && is_callable($this->afterInterleavedRead)) {
-            $afterInterleavedRead = $this->afterInterleavedRead;
-            $this->interleavedReadKey = null;
-            $this->afterInterleavedRead = null;
-            $afterInterleavedRead($this);
-        }
-        return $value;
+        return $this->values[$name] ?? null;
     }
 
     public function set(string $name, $value): void
@@ -168,11 +159,6 @@ final class FakeAmemberData
         return $this->values;
     }
 
-    public function afterNextRead(string $name, callable $callback): void
-    {
-        $this->interleavedReadKey = $name;
-        $this->afterInterleavedRead = $callback;
-    }
 }
 
 final class FakeAmemberInvoice
@@ -185,6 +171,7 @@ final class FakeAmemberInvoice
     public int $postEffectRefreshFailuresRemaining = 0;
     public bool $preservePendingStatusAfterPayment = false;
     public bool $preservePaidStatusAfterRefund = false;
+    private ?string $durableCheckoutAttemptOnRefresh = null;
     private array $paymentRecords = array();
     private array $refundRecords = array();
     private FakeAmemberData $data;
@@ -202,6 +189,13 @@ final class FakeAmemberInvoice
     public function refresh(): void
     {
         $this->trace[] = 'refresh';
+        if ($this->durableCheckoutAttemptOnRefresh !== null) {
+            $this->data->set(
+                PaymentGatewayAppCheckoutAttempt::STATE_DATA_KEY,
+                $this->durableCheckoutAttemptOnRefresh
+            );
+            $this->durableCheckoutAttemptOnRefresh = null;
+        }
         if ($this->effects && $this->postEffectRefreshFailuresRemaining > 0) {
             $this->postEffectRefreshFailuresRemaining--;
             throw new RuntimeException('simulated post-effect refresh failure');
@@ -326,15 +320,9 @@ final class FakeAmemberInvoice
         $this->data->update();
     }
 
-    public function persistCheckoutAttemptAfterNextRead(string $sessionPublicId): void
+    public function loadDurableCheckoutAttemptOnNextRefresh(string $sessionPublicId): void
     {
-        $this->data->afterNextRead(
-            PaymentGatewayAppCheckoutAttempt::STATE_DATA_KEY,
-            static function (FakeAmemberData $data) use ($sessionPublicId): void {
-                $data->set(PaymentGatewayAppCheckoutAttempt::STATE_DATA_KEY, $sessionPublicId);
-                $data->update();
-            }
-        );
+        $this->durableCheckoutAttemptOnRefresh = $sessionPublicId;
     }
 }
 
@@ -461,12 +449,44 @@ $trace = array();
 $di = (object)array('db' => new FakeAmemberDb($trace));
 $plugin = new Am_Paysystem_PaymentGatewayApp(array('webhook_secret' => $secret), $di);
 
-// A signed event may be admitted for attempt A before checkout B commits. The
-// receiver must re-read the durable attempt under the invoice lock before any effect.
+// A receiver object may still cache attempt A after checkout B is durable. Event B
+// must reach the shared lock and refresh before attempt identity is decided.
+foreach (array('1', '2') as $durableCurrentVersion) {
+    $durableCurrentInvoice = new FakeAmemberInvoice();
+    $durableCurrentInvoice->seedCheckoutAttempt('session-attempt-a');
+    $durableCurrentInvoice->loadDurableCheckoutAttemptOnNextRefresh('session-attempt-b');
+    $durableCurrentPayload = $durableCurrentVersion === '2'
+        ? v2Payload('delivery-durable-current-' . $durableCurrentVersion, 1, 1)
+        : array(
+            'id' => 'transaction-durable-current-v1',
+            'externalReference' => 'invoice-42',
+            'status' => 1,
+        );
+    $durableCurrentPayload['sessionPublicId'] = 'session-attempt-b';
+
+    $durableCurrentResult = executeIpn(
+        $plugin,
+        $durableCurrentInvoice,
+        $durableCurrentPayload,
+        $now,
+        $durableCurrentVersion === '2' ? '2' : null,
+        $durableCurrentVersion === '2' ? $durableCurrentPayload['deliveryId'] : null
+    );
+
+    ipnV2AssertSame(true, $durableCurrentResult['accepted'], 'A signed v' . $durableCurrentVersion . ' current-attempt event must be acknowledged.');
+    ipnV2AssertSame(
+        array('payment'),
+        $durableCurrentInvoice->effects,
+        'Signed v' . $durableCurrentVersion . ' event B must apply exactly once after locked refresh replaces cached attempt A with durable B.'
+    );
+}
+
+// A receiver object caching attempt A must not let event A affect durable attempt B.
+// The locked refresh is the only attempt-identity decision point.
 foreach (array('1', '2') as $interleavedVersion) {
     $interleavedInvoice = new FakeAmemberInvoice();
     $interleavedInvoice->seedCheckoutAttempt('session-attempt-a');
-    $interleavedInvoice->persistCheckoutAttemptAfterNextRead('session-attempt-b');
+    $interleavedInvoice->loadDurableCheckoutAttemptOnNextRefresh('session-attempt-b');
     $interleavedPayload = $interleavedVersion === '2'
         ? v2Payload('delivery-interleaved-' . $interleavedVersion, 1, 1)
         : array(
@@ -491,7 +511,7 @@ foreach (array('1', '2') as $interleavedVersion) {
         $interleavedInvoice->persistedState()[PaymentGatewayAppCheckoutAttempt::STATE_DATA_KEY] ?? null,
         'Checkout attempt B must be durable before signed v' . $interleavedVersion . ' processing reaches its effect.'
     );
-    ipnV2AssertSame(array(), $interleavedInvoice->effects, 'A stale signed v' . $interleavedVersion . ' event admitted before checkout B must not alter attempt B.');
+    ipnV2AssertSame(array(), $interleavedInvoice->effects, 'A stale signed v' . $interleavedVersion . ' event from cached attempt A must not alter durable attempt B.');
 }
 
 $checkoutLockInvoice = new FakeAmemberInvoice();

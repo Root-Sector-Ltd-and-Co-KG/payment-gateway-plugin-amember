@@ -1289,11 +1289,6 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     public function processValidated()
     {
-        if (!PaymentGatewayAppCheckoutAttempt::matchesSignedEvent($this->invoice, $this->parsedRequest)) {
-            echo "OK";
-            http_response_code(200);
-            return;
-        }
         if ($this->ipnVersion === 2) {
             PaymentGatewayAppIpnV2State::process(
                 $this->invoice,
