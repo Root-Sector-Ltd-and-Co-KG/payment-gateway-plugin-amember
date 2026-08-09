@@ -133,6 +133,8 @@ final class FakeAmemberData
 {
     private array $values = array();
     private array $trace;
+    private ?string $interleavedReadKey = null;
+    private $afterInterleavedRead = null;
 
     public function __construct(array &$trace)
     {
@@ -141,7 +143,14 @@ final class FakeAmemberData
 
     public function get(string $name)
     {
-        return $this->values[$name] ?? null;
+        $value = $this->values[$name] ?? null;
+        if ($this->interleavedReadKey === $name && is_callable($this->afterInterleavedRead)) {
+            $afterInterleavedRead = $this->afterInterleavedRead;
+            $this->interleavedReadKey = null;
+            $this->afterInterleavedRead = null;
+            $afterInterleavedRead($this);
+        }
+        return $value;
     }
 
     public function set(string $name, $value): void
@@ -157,6 +166,12 @@ final class FakeAmemberData
     public function values(): array
     {
         return $this->values;
+    }
+
+    public function afterNextRead(string $name, callable $callback): void
+    {
+        $this->interleavedReadKey = $name;
+        $this->afterInterleavedRead = $callback;
     }
 }
 
@@ -310,6 +325,17 @@ final class FakeAmemberInvoice
         $this->data->set(PaymentGatewayAppCheckoutAttempt::STATE_DATA_KEY, $sessionPublicId);
         $this->data->update();
     }
+
+    public function persistCheckoutAttemptAfterNextRead(string $sessionPublicId): void
+    {
+        $this->data->afterNextRead(
+            PaymentGatewayAppCheckoutAttempt::STATE_DATA_KEY,
+            static function (FakeAmemberData $data) use ($sessionPublicId): void {
+                $data->set(PaymentGatewayAppCheckoutAttempt::STATE_DATA_KEY, $sessionPublicId);
+                $data->update();
+            }
+        );
+    }
 }
 
 /** @var list<string> $failures */
@@ -434,6 +460,54 @@ $now = time();
 $trace = array();
 $di = (object)array('db' => new FakeAmemberDb($trace));
 $plugin = new Am_Paysystem_PaymentGatewayApp(array('webhook_secret' => $secret), $di);
+
+// A signed event may be admitted for attempt A before checkout B commits. The
+// receiver must re-read the durable attempt under the invoice lock before any effect.
+foreach (array('1', '2') as $interleavedVersion) {
+    $interleavedInvoice = new FakeAmemberInvoice();
+    $interleavedInvoice->seedCheckoutAttempt('session-attempt-a');
+    $interleavedInvoice->persistCheckoutAttemptAfterNextRead('session-attempt-b');
+    $interleavedPayload = $interleavedVersion === '2'
+        ? v2Payload('delivery-interleaved-' . $interleavedVersion, 1, 1)
+        : array(
+            'id' => 'transaction-interleaved-v1',
+            'externalReference' => 'invoice-42',
+            'status' => 1,
+        );
+    $interleavedPayload['sessionPublicId'] = 'session-attempt-a';
+
+    $interleavedResult = executeIpn(
+        $plugin,
+        $interleavedInvoice,
+        $interleavedPayload,
+        $now,
+        $interleavedVersion === '2' ? '2' : null,
+        $interleavedVersion === '2' ? $interleavedPayload['deliveryId'] : null
+    );
+
+    ipnV2AssertSame(true, $interleavedResult['accepted'], 'An interleaved signed v' . $interleavedVersion . ' stale attempt must be acknowledged.');
+    ipnV2AssertSame(
+        'session-attempt-b',
+        $interleavedInvoice->persistedState()[PaymentGatewayAppCheckoutAttempt::STATE_DATA_KEY] ?? null,
+        'Checkout attempt B must be durable before signed v' . $interleavedVersion . ' processing reaches its effect.'
+    );
+    ipnV2AssertSame(array(), $interleavedInvoice->effects, 'A stale signed v' . $interleavedVersion . ' event admitted before checkout B must not alter attempt B.');
+}
+
+$checkoutLockInvoice = new FakeAmemberInvoice();
+$checkoutLockTrace = array();
+$checkoutLockDb = new FakeAmemberDb($checkoutLockTrace);
+$checkoutPersistence = PaymentGatewayAppCheckoutAttempt::persistFromCheckoutResponse(
+    $checkoutLockInvoice,
+    array('sessionPublicId' => 'session-checkout-locked'),
+    $checkoutLockDb
+);
+ipnV2AssertSame('persisted', $checkoutPersistence, 'A valid checkout attempt must remain persistable.');
+ipnV2AssertSame(
+    array('lock', 'unlock'),
+    $checkoutLockTrace,
+    'Checkout attempt persistence must use the same invoice synchronization lock as webhook effects.'
+);
 
 foreach (array(0, -2, 2, 1) as $staleStatus) {
     foreach (array('1', '2') as $attemptVersion) {

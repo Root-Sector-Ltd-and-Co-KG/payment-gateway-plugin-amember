@@ -158,6 +158,26 @@ final class PaymentGatewayAppApiErrorContext
     }
 }
 
+final class PaymentGatewayAppInvoiceSynchronization
+{
+    const LOCK_WAIT_SECONDS = 5;
+
+    public static function acquire($invoice, $db)
+    {
+        $lockName = 'pgw-ipn-v2:' . substr(hash('sha256', (string)$invoice->pk()), 0, 48);
+        $lockAcquired = $db->selectCell('SELECT GET_LOCK(?, ?d)', $lockName, self::LOCK_WAIT_SECONDS);
+        if ((int)$lockAcquired !== 1) {
+            throw new Am_Exception_Paysystem('Unable to lock invoice payment state');
+        }
+        return $lockName;
+    }
+
+    public static function release($db, $lockName)
+    {
+        $db->selectCell('SELECT RELEASE_LOCK(?)', $lockName);
+    }
+}
+
 final class PaymentGatewayAppCheckoutAttempt
 {
     const STATE_DATA_KEY = 'payment_gateway_app_session_public_id';
@@ -171,7 +191,7 @@ final class PaymentGatewayAppCheckoutAttempt
             && preg_match('/\A[A-Za-z0-9._:-]+\z/', $value) === 1;
     }
 
-    public static function persistFromCheckoutResponse($invoice, array $responseBody)
+    public static function persistFromCheckoutResponse($invoice, array $responseBody, $db)
     {
         if (!array_key_exists('sessionPublicId', $responseBody)) {
             return 'omitted';
@@ -179,9 +199,15 @@ final class PaymentGatewayAppCheckoutAttempt
         if (!self::validIdentifier($responseBody['sessionPublicId'])) {
             return 'invalid';
         }
-        $invoice->data()->set(self::STATE_DATA_KEY, $responseBody['sessionPublicId']);
-        $invoice->data()->update();
-        return 'persisted';
+        $lockName = PaymentGatewayAppInvoiceSynchronization::acquire($invoice, $db);
+        try {
+            $invoice->refresh();
+            $invoice->data()->set(self::STATE_DATA_KEY, $responseBody['sessionPublicId']);
+            $invoice->data()->update();
+            return 'persisted';
+        } finally {
+            PaymentGatewayAppInvoiceSynchronization::release($db, $lockName);
+        }
     }
 
     public static function matchesSignedEvent($invoice, array $payload)
@@ -398,7 +424,11 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
             return;
         }
 
-        $attemptPersistence = PaymentGatewayAppCheckoutAttempt::persistFromCheckoutResponse($invoice, $responseBody);
+        $attemptPersistence = PaymentGatewayAppCheckoutAttempt::persistFromCheckoutResponse(
+            $invoice,
+            $responseBody,
+            $this->getDi()->db
+        );
         if ($attemptPersistence === 'invalid') {
             $result->setFailed('Payment session creation failed due to an invalid gateway response.');
             return;
@@ -476,7 +506,6 @@ final class PaymentGatewayAppIpnV2State
     const MAX_RETAINED_DELIVERIES = 100;
     const RETRY_WINDOW_SECONDS = 48 * 3600;
     const RETENTION_SAFETY_SECONDS = 3600;
-    const LOCK_WAIT_SECONDS = 5;
 
     public static function process(
         $invoice,
@@ -489,14 +518,13 @@ final class PaymentGatewayAppIpnV2State
         $receivedAt = null
     )
     {
-        $lockName = 'pgw-ipn-v2:' . substr(hash('sha256', (string)$invoice->pk()), 0, 48);
-        $lockAcquired = $db->selectCell('SELECT GET_LOCK(?, ?d)', $lockName, self::LOCK_WAIT_SECONDS);
-        if ((int)$lockAcquired !== 1) {
-            throw new Am_Exception_Paysystem('Unable to lock IPN v2 state');
-        }
+        $lockName = PaymentGatewayAppInvoiceSynchronization::acquire($invoice, $db);
 
         try {
             $invoice->refresh();
+            if (!PaymentGatewayAppCheckoutAttempt::matchesSignedEvent($invoice, $payload)) {
+                return 'stale_attempt';
+            }
             $state = self::loadState($invoice->data()->get(self::STATE_DATA_KEY));
             $receivedAt = $receivedAt === null ? time() : (int)$receivedAt;
             if ($receivedAt <= 0) {
@@ -665,7 +693,7 @@ final class PaymentGatewayAppIpnV2State
             self::saveState($invoice, $state);
             return 'applied';
         } finally {
-            $db->selectCell('SELECT RELEASE_LOCK(?)', $lockName);
+            PaymentGatewayAppInvoiceSynchronization::release($db, $lockName);
         }
     }
 
@@ -1285,7 +1313,16 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
             return;
         }
 
-        $this->applyPaymentEffect();
+        $db = $this->getPlugin()->getDi()->db;
+        $lockName = PaymentGatewayAppInvoiceSynchronization::acquire($this->invoice, $db);
+        try {
+            $this->invoice->refresh();
+            if (PaymentGatewayAppCheckoutAttempt::matchesSignedEvent($this->invoice, $this->parsedRequest)) {
+                $this->applyPaymentEffect();
+            }
+        } finally {
+            PaymentGatewayAppInvoiceSynchronization::release($db, $lockName);
+        }
         // Send HTTP 200 response with "OK" body
         echo "OK";
         http_response_code(200);

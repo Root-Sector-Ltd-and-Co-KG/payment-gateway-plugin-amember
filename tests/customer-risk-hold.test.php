@@ -10,11 +10,19 @@ class Am_Paysystem_Abstract
     public array $config = array();
     public array $errorLogs = array();
     public array $otherLogs = array();
+    private object $di;
+
+    public function __construct()
+    {
+        $this->di = (object)array('db' => new CheckoutAttemptDbStub());
+    }
 
     public function getConfig($key)
     {
         return $this->config[$key] ?? null;
     }
+
+    public function getDi(): object { return $this->di; }
 
     public function logError($message, $context = array()): void
     {
@@ -29,6 +37,14 @@ class Am_Paysystem_Abstract
     public function getReturnUrl(): string { return 'https://merchant.test/return'; }
     public function getCancelUrl(): string { return 'https://merchant.test/cancel'; }
     public function getPluginUrl($path): string { return 'https://merchant.test/' . $path; }
+}
+
+class CheckoutAttemptDbStub
+{
+    public function selectCell($query, ...$params): int
+    {
+        return 1;
+    }
 }
 
 class Am_Paysystem_Transaction_Incoming_Thanks {}
@@ -133,6 +149,8 @@ $invoice = new class {
     public function getEmail(): string { return 'customer@example.test'; }
     public function getItems(): array { return array(); }
     public function data(): CheckoutAttemptDataStub { return $this->attemptData; }
+    public function pk(): int { return 1; }
+    public function refresh(): void {}
 };
 $result = new class {
     public $action;
