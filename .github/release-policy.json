@@ -8,7 +8,7 @@
   },
   "releases": {
     "1.2.0": {
-      "sourceRevision": "e5db742f8f64bdabeeb6a7248d334ad74848c441",
+      "sourceRevision": "ad4fff011033ced53e1d46ff0cf51887399bbd77",
       "artifactName": "payment-gateway-app_v1.2.0.zip",
       "archiveRoot": "payment-gateway-app",
       "prepareScript": "scripts/prepare-release.php",
