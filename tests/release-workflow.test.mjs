@@ -34,6 +34,11 @@ test("aMember PR validation is separate and cannot publish", () => {
   assert.match(prWorkflow, /node --test tests\/release-policy\.test\.mjs tests\/release-workflow\.test\.mjs tests\/publish-release\.test\.mjs/);
 });
 
+test("aMember PR validation fetches the pinned parent source", () => {
+  assert.match(prWorkflow, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
+  assert.match(prWorkflow, /fetch-depth: 2/);
+});
+
 test("every action in aMember release-control workflows is pinned to a reviewed commit", () => {
   const actionLines = `${workflow}\n${prWorkflow}`.split("\n").filter((line) => /\buses:/.test(line));
   assert.ok(actionLines.length > 0);
