@@ -1104,6 +1104,11 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
         ) {
             $this->rejectV2Envelope('schema_version');
         }
+        foreach (array('transactionId', 'gatewayTransactionId', 'paymentStatus', 'disputeStatus', 'chargebackStatus', 'external_reference', 'chargeback') as $legacyAlias) {
+            if (array_key_exists($legacyAlias, $this->parsedRequest)) {
+                $this->rejectV2Envelope('legacy_alias_not_allowed');
+            }
+        }
         if (
             !isset($this->parsedRequest['id'])
             || !is_string($this->parsedRequest['id'])
@@ -1112,16 +1117,6 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
             || preg_match('/[\x00-\x1F\x7F]/', $this->parsedRequest['id']) === 1
         ) {
             $this->rejectV2Envelope('transaction_identity');
-        }
-        if (
-            array_key_exists('external_reference', $this->parsedRequest)
-            || (
-                isset($this->parsedRequest['chargeback'])
-                && is_array($this->parsedRequest['chargeback'])
-                && array_key_exists('externalReference', $this->parsedRequest['chargeback'])
-            )
-        ) {
-            $this->rejectV2Envelope('external_reference_alias');
         }
         if (
             !isset($this->parsedRequest['externalReference'])

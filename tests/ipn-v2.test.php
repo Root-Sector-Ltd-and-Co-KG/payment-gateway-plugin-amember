@@ -818,6 +818,7 @@ $semanticIdentityEquivalent = v2Payload('delivery-semantic-equivalent', 1, 1);
 $semanticIdentityEquivalent['occurredAt'] = '2026-07-26T18:32:00Z';
 $semanticIdentityEquivalent['disputeStatus'] = 'lost';
 $semanticIdentityEquivalent['chargeback'] = array('status' => 'accepted');
+$semanticStateBeforeAlias = persistedV2State($semanticIdentityInvoice);
 $semanticIdentityEquivalentResult = executeIpn(
     $plugin,
     $semanticIdentityInvoice,
@@ -833,9 +834,14 @@ ipnV2AssertSame(
     'A replacement delivery must be rejected when its status conflicts with the claimed transaction/event version.'
 );
 ipnV2AssertSame(
-    true,
+    false,
     $semanticIdentityEquivalentResult['accepted'],
-    'An equivalent replacement delivery may recover despite retry-only field and ignored legacy-alias changes.'
+    'A replacement delivery containing legacy aliases must be rejected before recovering pending v2 state.'
+);
+ipnV2AssertSame(
+    $semanticStateBeforeAlias,
+    persistedV2State($semanticIdentityInvoice),
+    'A rejected alias-bearing replacement must not mutate the pending v2 claim.'
 );
 ipnV2AssertSame(
     array('payment'),
@@ -1267,7 +1273,7 @@ $canonicalReferenceResult = executeIpn(
 ipnV2AssertSame(true, $canonicalReferenceResult['accepted'], 'Rejected reference aliases and malformed references must not block a valid lower canonical event.');
 ipnV2AssertSame(array('payment'), $invalidReferenceInvoice->effects, 'Invalid v2 references must not route or advance receiver state.');
 
-// Legacy dispute aliases in a v2 envelope cannot override the canonical integer status.
+// A v2 envelope rejects every legacy alias before routing or receiver-state mutation.
 $hybridInvoice = new FakeAmemberInvoice();
 $hybridPayload = v2Payload('delivery-hybrid', 1, 1);
 $hybridPayload['disputeStatus'] = 'lost';
@@ -1277,12 +1283,45 @@ $hybridPayload['chargeback'] = array(
     'transactionId' => 'legacy-chargeback-alias',
 );
 $hybridResult = executeIpn($plugin, $hybridInvoice, $hybridPayload, $now, '2', 'delivery-hybrid');
-ipnV2AssertSame(true, $hybridResult['accepted'], 'A valid v2 status remains authoritative in a hybrid payload.');
+ipnV2AssertSame(false, $hybridResult['accepted'], 'A hybrid v2 payload containing legacy aliases must be rejected.');
 ipnV2AssertSame(
-    array('payment'),
+    array(),
     $hybridInvoice->effects,
-    'Legacy dispute aliases must not turn a successful v2 status into a chargeback effect.'
+    'Rejected legacy aliases must cause no v2 payment effect.'
 );
+ipnV2AssertSame(array(), $hybridInvoice->persistedState(), 'Rejected legacy aliases must not create v2 receiver state.');
+
+$legacyAliasPayloads = array(
+    'transactionId' => array('fields' => array('transactionId' => 'legacy-transaction'), 'v1Effects' => array('payment')),
+    'gatewayTransactionId' => array('fields' => array('gatewayTransactionId' => 'legacy-gateway-transaction'), 'v1Effects' => array('payment')),
+    'paymentStatus' => array('fields' => array('paymentStatus' => 'paid'), 'v1Effects' => array('payment')),
+    'disputeStatus' => array('fields' => array('disputeStatus' => 'lost'), 'v1Effects' => array('chargeback')),
+    'chargebackStatus' => array('fields' => array('chargebackStatus' => 'accepted'), 'v1Effects' => array('chargeback')),
+    'external_reference' => array('fields' => array('external_reference' => 'invoice-42'), 'v1Effects' => array('payment')),
+    'chargeback container' => array('fields' => array('chargeback' => array('status' => 'open')), 'v1Effects' => array('chargeback')),
+);
+foreach ($legacyAliasPayloads as $alias => $legacyCase) {
+    $aliasInvoice = new FakeAmemberInvoice();
+    $deliveryId = 'delivery-alias-' . str_replace(array(' ', '_'), '-', $alias);
+    $payload = array_merge(v2Payload($deliveryId, 1, 1), $legacyCase['fields']);
+    $result = executeIpn($plugin, $aliasInvoice, $payload, $now, '2', $deliveryId);
+    ipnV2AssertSame(false, $result['accepted'], 'The ' . $alias . ' legacy alias must be rejected in v2.');
+    ipnV2AssertSame(array(), $aliasInvoice->effects, 'The ' . $alias . ' legacy alias must cause no v2 effect.');
+    ipnV2AssertSame(array(), $aliasInvoice->persistedState(), 'The ' . $alias . ' legacy alias must not create v2 receiver state.');
+}
+
+// Signed v1 remains compatible with canonical requests that include legacy alias fields.
+foreach ($legacyAliasPayloads as $alias => $legacyCase) {
+    $legacyInvoice = new FakeAmemberInvoice();
+    $legacyPayload = array_merge(
+        array('id' => 'transaction-v1-' . str_replace(array(' ', '_'), '-', $alias), 'externalReference' => 'invoice-42', 'status' => 1),
+        $legacyCase['fields']
+    );
+    $legacyResult = executeIpn($plugin, $legacyInvoice, $legacyPayload, $now, null, null);
+    ipnV2AssertSame(true, $legacyResult['accepted'], 'The signed v1 path must retain compatibility when ' . $alias . ' is present.');
+    ipnV2AssertSame($legacyCase['v1Effects'], $legacyInvoice->effects, 'The signed v1 ' . $alias . ' payload must preserve legacy effect behavior.');
+    ipnV2AssertSame(array(), $legacyInvoice->persistedState(), 'The signed v1 ' . $alias . ' payload must not create v2 receiver state.');
+}
 
 // The bounded migration path still accepts the existing signed v1 shape.
 $v1Invoice = new FakeAmemberInvoice();
