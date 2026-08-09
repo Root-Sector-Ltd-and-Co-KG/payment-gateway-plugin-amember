@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -146,4 +147,25 @@ test("release policy rejects source retargeting, under-versioning, and malformed
     () => validateReleasePolicy({ ...base, commits: [{ sha: "b".repeat(40), message: "update receiver" }] }),
     /valid Conventional Commit/,
   );
+});
+const controlBundlePath = path.join(root, "scripts/release-control-digest.mjs");
+
+test("release-control digest binds the exact publication controls and fails on a missing file", async (t) => {
+  const { RELEASE_CONTROL_FILES, calculateReleaseControlBundle } = await import(pathToFileURL(controlBundlePath));
+  assert.deepEqual(RELEASE_CONTROL_FILES, [
+    ".github/workflows/phpreleaser.yml",
+    ".github/release-policy.json",
+    "scripts/release-control-digest.mjs",
+    "scripts/validate-release-policy.mjs",
+    "scripts/prepare-release.php",
+    "scripts/publish-release.mjs",
+  ]);
+  const first = calculateReleaseControlBundle(root);
+  const second = calculateReleaseControlBundle(root);
+  assert.deepEqual(second, first);
+  assert.match(first.digest, /^sha256:[0-9a-f]{64}$/);
+
+  const fixtureRoot = mkdtempSync(path.join(os.tmpdir(), "release-controls-"));
+  t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  assert.throws(() => calculateReleaseControlBundle(fixtureRoot), /missing release-control file/i);
 });
