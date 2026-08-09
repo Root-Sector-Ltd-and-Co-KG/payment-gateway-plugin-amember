@@ -70,15 +70,19 @@ try {
     releaseAssertSame(true, $missingChangelogRejected, 'A release without a matching changelog entry must be rejected.');
 
     $workflow = file_get_contents(dirname(__DIR__) . '/.github/workflows/phpreleaser.yml');
-    releaseAssertContains('- "**"', $workflow, 'The workflow must validate every tag name, including tags containing slashes.');
-    releaseAssertContains('PLUGIN_RELEASE_VERSION: ${{ github.ref_name }}', $workflow, 'The workflow must derive the release version from the Git tag.');
+    releaseAssertContains('workflow_dispatch:', $workflow, 'Publication must require a manual pre-tag dispatch.');
+    releaseAssertContains('source_sha:', $workflow, 'Publication must select an exact reviewed source commit.');
+    releaseAssertContains('PLUGIN_RELEASE_VERSION: ${{ inputs.version', $workflow, 'Publication must use the selected semantic version.');
+    releaseAssertContains("permissions:\n  contents: read", $workflow, 'The workflow default must be read-only.');
+    releaseAssertContains('needs: validate', $workflow, 'Publication must depend on successful validation.');
+    releaseAssertContains("permissions:\n      contents: write", $workflow, 'Only publication may write repository contents.');
     releaseAssertContains('php tests/ipn-v2.test.php', $workflow, 'The release workflow must execute the IPN v2 receiver regression before packaging.');
     releaseAssertNotContains('payment-gateway-release-orchestrator/', $workflow, 'A public plugin workflow must not import the private release orchestrator.');
-    releaseAssertNotContains('validate_release_policy', $workflow, 'Release publication must not depend on an inaccessible private validation job.');
-    releaseAssertContains('php scripts/prepare-release.php "$PLUGIN_RELEASE_VERSION"', $workflow, 'The workflow must prepare versioned release files.');
-    releaseAssertContains('filename: payment-gateway-app_v${{ env.PLUGIN_RELEASE_VERSION }}.zip', $workflow, 'The archive filename must include the release version.');
-    releaseAssertContains('payment-gateway-app/scripts/* payment-gateway-app/tests/*', $workflow, 'Development scripts and tests must be excluded from the archive.');
-    releaseAssertContains('bodyFile: payment-gateway-app/RELEASE.md', $workflow, 'The GitHub release must use the matching changelog section.');
+    releaseAssertContains('scripts/validate-release-policy.mjs', $workflow, 'Publication must run the repository-local SemVer policy.');
+    releaseAssertContains('payment-gateway-app_v${{ inputs.version }}.zip', $workflow, 'The archive filename must include the selected version.');
+    releaseAssertContains('sha256sum', $workflow, 'Publication must create an exact SHA-256 checksum asset.');
+    releaseAssertContains('gh release create', $workflow, 'Publication must create a new immutable release.');
+    releaseAssertNotContains('--clobber', $workflow, 'Publication must never replace a release asset.');
 
     $sourceReadme = file_get_contents(dirname(__DIR__) . '/README.md');
     releaseAssertContains('**Version:** dev', $sourceReadme, 'The source README must use the release-time version placeholder.');
