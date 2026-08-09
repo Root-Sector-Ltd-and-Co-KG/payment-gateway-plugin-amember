@@ -36,7 +36,7 @@ test("aMember PR validation is separate and cannot publish", () => {
 
 test("aMember PR validation fetches the pinned parent source", () => {
   assert.match(prWorkflow, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
-  assert.match(prWorkflow, /fetch-depth: 2/);
+  assert.match(prWorkflow, /fetch-depth: 0/);
 });
 
 test("every action in aMember release-control workflows is pinned to a reviewed commit", () => {
