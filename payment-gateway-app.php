@@ -536,7 +536,9 @@ final class PaymentGatewayAppIpnV2State
                 self::saveState($invoice, $state);
             }
 
-            $applyEffect();
+            if ($applyEffect() !== true) {
+                throw new Am_Exception_Paysystem('IPN v2 effect prerequisite is not yet available');
+            }
 
             $invoice->refresh();
             $state = self::loadState($invoice->data()->get(self::STATE_DATA_KEY));
@@ -706,6 +708,12 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     private function getExternalReference()
     {
+        if ($this->ipnVersion === 2) {
+            return isset($this->parsedRequest['externalReference'])
+                && is_string($this->parsedRequest['externalReference'])
+                ? $this->parsedRequest['externalReference']
+                : '';
+        }
         return $this->getParsedScalar(array('externalReference', 'chargeback.externalReference'));
     }
 
@@ -891,6 +899,25 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
         ) {
             $this->rejectV2Envelope('transaction_identity');
         }
+        if (
+            array_key_exists('external_reference', $this->parsedRequest)
+            || (
+                isset($this->parsedRequest['chargeback'])
+                && is_array($this->parsedRequest['chargeback'])
+                && array_key_exists('externalReference', $this->parsedRequest['chargeback'])
+            )
+        ) {
+            $this->rejectV2Envelope('external_reference_alias');
+        }
+        if (
+            !isset($this->parsedRequest['externalReference'])
+            || !is_string($this->parsedRequest['externalReference'])
+            || trim($this->parsedRequest['externalReference']) === ''
+            || strlen($this->parsedRequest['externalReference']) > 64
+            || preg_match('/[\x00-\x1F\x7F]/', $this->parsedRequest['externalReference']) === 1
+        ) {
+            $this->rejectV2Envelope('external_reference');
+        }
 
         $deliveryId = isset($this->parsedRequest['deliveryId']) ? $this->parsedRequest['deliveryId'] : null;
         $headerDeliveryId = $this->request->getHeader('X-IPN-Delivery-ID');
@@ -1033,7 +1060,7 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
                 $this->parsedRequest,
                 $this->rawRequestBody,
                 function () {
-                    $this->applyPaymentEffect();
+                    return $this->applyPaymentEffect();
                 }
             );
             echo "OK";
@@ -1065,7 +1092,7 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
             case 0: // pending
             case -1: // initiated
                 // do nothing for pending/initiated
-                break;
+                return true;
             case 1: // successful
                 if (
                     $this->invoice->status != Invoice::PAID
@@ -1073,37 +1100,39 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
                 ) {
                     $this->invoice->addPayment($this);
                 }
-                break;
+                return true;
             case 2: // failed
-                if (
-                    $this->invoice->status == Invoice::PAID
-                    && ($this->ipnVersion !== 2 || !$this->hasExistingRefundReceipt(InvoiceRefund::VOID))
-                ) {
+                if ($this->ipnVersion === 2 && $this->hasExistingRefundReceipt(InvoiceRefund::VOID)) {
+                    return true;
+                }
+                if ($this->invoice->status == Invoice::PAID) {
                     $this->invoice->addVoid($this, $this->getReceiptId());
+                    return true;
                 }
-                break;
+                return $this->ipnVersion !== 2;
             case 3: // refunded
-                if (
-                    $this->invoice->status == Invoice::PAID
-                    && ($this->ipnVersion !== 2 || !$this->hasExistingRefundReceipt(InvoiceRefund::REFUND))
-                ) {
-                    $this->invoice->addRefund($this, $this->getReceiptId());
+                if ($this->ipnVersion === 2 && $this->hasExistingRefundReceipt(InvoiceRefund::REFUND)) {
+                    return true;
                 }
-                break;
+                if ($this->invoice->status == Invoice::PAID) {
+                    $this->invoice->addRefund($this, $this->getReceiptId());
+                    return true;
+                }
+                return $this->ipnVersion !== 2;
             case 4: // chargeback
                 if ($disputeStatus === 'won') {
-                    break;
+                    return true;
                 }
                 $this->addChargebackIdempotently();
-                break;
+                return true;
             case -2: // cancelled
                 if ($this->invoice->status != Invoice::CANCELLED && $this->invoice->status != Invoice::PAID) {
                     $this->invoice->setCancelled(true);
                 }
-                break;
+                return true;
             default:
                 // Do nothing for other statuses
-                break;
+                return true;
         }
     }
 }

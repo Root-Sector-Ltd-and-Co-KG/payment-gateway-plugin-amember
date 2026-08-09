@@ -313,6 +313,13 @@ function ipnV2AssertTrue(bool $actual, string $message): void
     ipnV2AssertSame(true, $actual, $message);
 }
 
+function persistedV2State(FakeAmemberInvoice $invoice): array
+{
+    $stored = $invoice->persistedState()[PaymentGatewayAppIpnV2State::STATE_DATA_KEY] ?? '';
+    $decoded = is_string($stored) ? json_decode($stored, true) : null;
+    return is_array($decoded) ? $decoded : array();
+}
+
 function v2Payload(string $deliveryId, int $eventVersion, $status = 1): array
 {
     return array(
@@ -456,6 +463,68 @@ ipnV2AssertSame(
     $recoverableInvoice->effects,
     'Recovery must apply the payment exactly once and later retries must not repeat it.'
 );
+
+// Out-of-order terminal events stay pending until their payment prerequisite exists.
+foreach (array(2 => 'void', 3 => 'refund') as $terminalStatus => $terminalEffect) {
+    $outOfOrderInvoice = new FakeAmemberInvoice();
+    $terminalDeliveryId = 'delivery-out-of-order-' . $terminalEffect;
+    $terminalPayload = v2Payload($terminalDeliveryId, 2, $terminalStatus);
+    $terminalBeforePayment = executeIpn(
+        $plugin,
+        $outOfOrderInvoice,
+        $terminalPayload,
+        $now,
+        '2',
+        $terminalDeliveryId
+    );
+    $pendingState = persistedV2State($outOfOrderInvoice);
+    $transactionKey = hash('sha256', 'transaction-123');
+    $deliveryKey = hash('sha256', $terminalDeliveryId);
+
+    ipnV2AssertSame(false, $terminalBeforePayment['accepted'], 'An out-of-order ' . $terminalEffect . ' without a payment receipt must remain retryable.');
+    ipnV2AssertSame(array(), $outOfOrderInvoice->effects, 'A prerequisite-missing ' . $terminalEffect . ' must have no accounting effect.');
+    ipnV2AssertSame('pending', $pendingState['deliveries'][$deliveryKey]['phase'] ?? null, 'A prerequisite-missing ' . $terminalEffect . ' delivery must retain its durable pending claim.');
+    ipnV2AssertSame(null, $pendingState['highestEventVersions'][$transactionKey] ?? null, 'A prerequisite-missing ' . $terminalEffect . ' must not advance ordering state.');
+
+    $paymentDeliveryId = 'delivery-before-' . $terminalEffect;
+    $paymentPayload = v2Payload($paymentDeliveryId, 1, 1);
+    $paymentResult = executeIpn(
+        $plugin,
+        $outOfOrderInvoice,
+        $paymentPayload,
+        $now + 1,
+        '2',
+        $paymentDeliveryId
+    );
+    $terminalRetry = executeIpn(
+        $plugin,
+        $outOfOrderInvoice,
+        $terminalPayload,
+        $now + 2,
+        '2',
+        $terminalDeliveryId
+    );
+    $terminalDuplicate = executeIpn(
+        $plugin,
+        $outOfOrderInvoice,
+        $terminalPayload,
+        $now + 3,
+        '2',
+        $terminalDeliveryId
+    );
+    $appliedState = persistedV2State($outOfOrderInvoice);
+    $refundRecords = $outOfOrderInvoice->getRefundRecords();
+
+    ipnV2AssertSame(true, $paymentResult['accepted'], 'The earlier payment must remain processable after an out-of-order ' . $terminalEffect . '.');
+    ipnV2AssertSame(true, $terminalRetry['accepted'], 'The ' . $terminalEffect . ' must apply when retried after payment.');
+    ipnV2AssertSame(true, $terminalDuplicate['accepted'], 'An applied ' . $terminalEffect . ' retry must be acknowledged as a duplicate.');
+    ipnV2AssertSame(array('payment', $terminalEffect), $outOfOrderInvoice->effects, 'Payment followed by retried ' . $terminalEffect . ' must produce accounting exactly once.');
+    ipnV2AssertSame(1, count($outOfOrderInvoice->getPaymentRecords()), 'The prerequisite payment must have one durable receipt.');
+    ipnV2AssertSame(1, count($refundRecords), 'The retried ' . $terminalEffect . ' must have one durable receipt.');
+    ipnV2AssertSame('transaction-123', $refundRecords[0]->original_receipt_id ?? null, 'The retried ' . $terminalEffect . ' must reconcile to the gateway payment receipt.');
+    ipnV2AssertSame('applied', $appliedState['deliveries'][$deliveryKey]['phase'] ?? null, 'The retried ' . $terminalEffect . ' delivery must become applied only after its receipt exists.');
+    ipnV2AssertSame(2, $appliedState['highestEventVersions'][$transactionKey] ?? null, 'Ordering state must advance after the ' . $terminalEffect . ' effect is durable.');
+}
 
 // A committed aMember effect receipt closes the crash window before receiver state can be marked applied.
 $paymentReceiptInvoice = new FakeAmemberInvoice();
@@ -828,6 +897,63 @@ ipnV2AssertSame(
     $missingIdInvoice->effects,
     'Invalid v2 IDs must not cause effects or advance ordering state.'
 );
+
+// V2 invoice routing accepts only the bounded canonical top-level externalReference.
+$invalidReferenceInvoice = new FakeAmemberInvoice();
+$invalidReferences = array(
+    'alias-only-nested' => (function (): array {
+        $payload = v2Payload('delivery-reference-alias-only', 10);
+        unset($payload['externalReference']);
+        $payload['chargeback'] = array('externalReference' => 'invoice-42');
+        return $payload;
+    })(),
+    'alias-only-snake-case' => (function (): array {
+        $payload = v2Payload('delivery-reference-snake-case', 11);
+        unset($payload['externalReference']);
+        $payload['external_reference'] = 'invoice-42';
+        return $payload;
+    })(),
+    'hybrid-nested' => (function (): array {
+        $payload = v2Payload('delivery-reference-hybrid', 12);
+        $payload['chargeback'] = array('externalReference' => 'another-invoice');
+        return $payload;
+    })(),
+    'hybrid-snake-case' => (function (): array {
+        $payload = v2Payload('delivery-reference-hybrid-snake-case', 13);
+        $payload['external_reference'] = 'another-invoice';
+        return $payload;
+    })(),
+    'typed' => (function (): array {
+        $payload = v2Payload('delivery-reference-typed', 14);
+        $payload['externalReference'] = 42;
+        return $payload;
+    })(),
+    'blank' => (function (): array {
+        $payload = v2Payload('delivery-reference-blank', 15);
+        $payload['externalReference'] = '   ';
+        return $payload;
+    })(),
+    'oversized' => (function (): array {
+        $payload = v2Payload('delivery-reference-oversized', 16);
+        $payload['externalReference'] = str_repeat('r', 65);
+        return $payload;
+    })(),
+);
+foreach ($invalidReferences as $case => $payload) {
+    $result = executeIpn($plugin, $invalidReferenceInvoice, $payload, $now, '2', $payload['deliveryId']);
+    ipnV2AssertSame(false, $result['accepted'], 'The ' . $case . ' v2 external reference must be rejected before invoice routing.');
+}
+$canonicalReferencePayload = v2Payload('delivery-reference-canonical', 1, 1);
+$canonicalReferenceResult = executeIpn(
+    $plugin,
+    $invalidReferenceInvoice,
+    $canonicalReferencePayload,
+    $now + 1,
+    '2',
+    'delivery-reference-canonical'
+);
+ipnV2AssertSame(true, $canonicalReferenceResult['accepted'], 'Rejected reference aliases and malformed references must not block a valid lower canonical event.');
+ipnV2AssertSame(array('payment'), $invalidReferenceInvoice->effects, 'Invalid v2 references must not route or advance receiver state.');
 
 // Legacy dispute aliases in a v2 envelope cannot override the canonical integer status.
 $hybridInvoice = new FakeAmemberInvoice();
