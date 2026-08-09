@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const policyPath = path.join(root, "scripts/validate-release-policy.mjs");
+const finalReceiverRevision = "f5b5fb7ce6d3bd4a554f7cf0a90810b20527ee95";
 
 test("release policy implementation is repository-local", () => {
   assert.ok(existsSync(policyPath), "scripts/validate-release-policy.mjs must exist");
@@ -24,7 +26,7 @@ test("trusted release manifest binds the protected workflow, policy, source, ver
     },
     releases: {
       "1.2.0": {
-        sourceRevision: "c3086653cdccc6ebeb62730ab03567942a1b3ff4",
+        sourceRevision: finalReceiverRevision,
         artifactName: "payment-gateway-app_v1.2.0.zip",
         archiveRoot: "payment-gateway-app",
         prepareScript: "scripts/prepare-release.php",
@@ -38,7 +40,7 @@ test("trusted release manifest binds the protected workflow, policy, source, ver
   assert.deepEqual(validateTrustedRelease({
     manifest,
     requestedVersion: "1.2.0",
-    requestedSourceRevision: "c3086653cdccc6ebeb62730ab03567942a1b3ff4",
+    requestedSourceRevision: finalReceiverRevision,
     workflowRef: "refs/heads/main",
     defaultBranch: "main",
     workflowPath: ".github/workflows/phpreleaser.yml",
@@ -57,7 +59,7 @@ test("trusted release manifest binds the protected workflow, policy, source, ver
       () => validateTrustedRelease({
         manifest,
         requestedVersion: "1.2.0",
-        requestedSourceRevision: "c3086653cdccc6ebeb62730ab03567942a1b3ff4",
+        requestedSourceRevision: finalReceiverRevision,
         workflowRef: "refs/heads/main",
         defaultBranch: "main",
         workflowPath: ".github/workflows/phpreleaser.yml",
@@ -67,6 +69,20 @@ test("trusted release manifest binds the protected workflow, policy, source, ver
       /trusted release manifest|protected default branch/i,
     );
   }
+});
+
+test("1.2.0 packages the exact final aMember receiver source", () => {
+  const manifest = JSON.parse(readFileSync(path.join(root, ".github/release-policy.json"), "utf8"));
+  const sourceRevision = manifest.releases["1.2.0"].sourceRevision;
+  assert.equal(sourceRevision, finalReceiverRevision);
+
+  const pluginPath = "payment-gateway-app.php";
+  const archive = execFileSync("git", ["-C", root, "archive", sourceRevision, pluginPath]);
+  const archivedPlugin = execFileSync("tar", ["-xOf", "-", pluginPath], {
+    input: archive,
+    encoding: "utf8",
+  });
+  assert.equal(archivedPlugin, readFileSync(path.join(root, pluginPath), "utf8"));
 });
 
 test("release policy CLI maps documented kebab-case arguments", async () => {
