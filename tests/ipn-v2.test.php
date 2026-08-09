@@ -295,6 +295,15 @@ final class FakeAmemberInvoice
     {
         return $this->data->values();
     }
+
+    public function seedPersistedV2State(array $state): void
+    {
+        $this->data->set(
+            PaymentGatewayAppIpnV2State::STATE_DATA_KEY,
+            json_encode($state, JSON_THROW_ON_ERROR)
+        );
+        $this->data->update();
+    }
 }
 
 /** @var list<string> $failures */
@@ -387,6 +396,31 @@ function executeIpn(
             'output' => '',
         );
     }
+}
+
+function processV2StateAt(
+    FakeAmemberInvoice $invoice,
+    FakeAmemberDb $db,
+    array $payload,
+    int $receivedAt,
+    bool $effectReady,
+    int &$effectCount
+) {
+    return PaymentGatewayAppIpnV2State::process(
+        $invoice,
+        $db,
+        (string)$payload['id'],
+        $payload,
+        json_encode($payload, JSON_THROW_ON_ERROR),
+        static function () use ($effectReady): bool {
+            return $effectReady;
+        },
+        static function () use (&$effectCount): bool {
+            $effectCount++;
+            return true;
+        },
+        $receivedAt
+    );
 }
 
 $secret = 'whsec_test_receiver_secret';
@@ -568,6 +602,52 @@ ipnV2AssertSame(
     array('payment'),
     $paymentReceiptInvoice->effects,
     'Retry after a committed payment receipt must not repeat the payment effect.'
+);
+
+// A post-effect persistence interruption must durably fence lower versions before accounting runs.
+$interruptedOrderingInvoice = new FakeAmemberInvoice();
+$interruptedOrderingInvoice->preservePendingStatusAfterPayment = true;
+$interruptedOrderingInvoice->postEffectRefreshFailuresRemaining = 1;
+$interruptedHigherPayload = v2Payload('delivery-interrupted-higher', 2, 1);
+$interruptedHigherResult = executeIpn(
+    $plugin,
+    $interruptedOrderingInvoice,
+    $interruptedHigherPayload,
+    $now,
+    '2',
+    'delivery-interrupted-higher'
+);
+$interruptedLowerPayload = v2Payload('delivery-interrupted-lower', 1, -2);
+$interruptedLowerResult = executeIpn(
+    $plugin,
+    $interruptedOrderingInvoice,
+    $interruptedLowerPayload,
+    $now + 1,
+    '2',
+    'delivery-interrupted-lower'
+);
+$interruptedHigherRetry = executeIpn(
+    $plugin,
+    $interruptedOrderingInvoice,
+    $interruptedHigherPayload,
+    $now + 2,
+    '2',
+    'delivery-interrupted-higher'
+);
+$interruptedOrderingState = persistedV2State($interruptedOrderingInvoice);
+$interruptedTransactionKey = hash('sha256', 'transaction-123');
+ipnV2AssertSame(false, $interruptedHigherResult['accepted'], 'A post-payment persistence interruption must not be acknowledged.');
+ipnV2AssertSame(true, $interruptedLowerResult['accepted'], 'A lower event after an interrupted higher effect must be acknowledged as stale.');
+ipnV2AssertSame(true, $interruptedHigherRetry['accepted'], 'The interrupted higher event must remain recoverable.');
+ipnV2AssertSame(
+    array('payment'),
+    $interruptedOrderingInvoice->effects,
+    'A lower cancellation must not regress an interrupted higher payment effect.'
+);
+ipnV2AssertSame(
+    2,
+    $interruptedOrderingState['highestEventVersions'][$interruptedTransactionKey] ?? null,
+    'The higher ordering claim must survive the post-effect interruption and recovery.'
 );
 
 $refundReceiptInvoice = new FakeAmemberInvoice();
@@ -787,6 +867,159 @@ $staleResult = executeIpn($plugin, $orderedInvoice, v2Payload('delivery-stale', 
 ipnV2AssertSame(true, $newerResult['accepted'], 'The newer v2 event must be accepted.');
 ipnV2AssertSame(true, $staleResult['accepted'], 'A stale v2 event must be acknowledged successfully.');
 ipnV2AssertSame(array('payment'), $orderedInvoice->effects, 'A stale failed event must not regress a paid invoice.');
+
+// Retention keeps every recoverable/replay claim through 48 hours plus one hour of safety.
+$retentionInvoice = new FakeAmemberInvoice();
+$retentionTrace = array();
+$retentionDb = new FakeAmemberDb($retentionTrace);
+$retentionStart = 1_800_000_000;
+$retentionEffects = 0;
+$retentionPayloads = array();
+
+// Existing format-v1 claims without timestamps migrate conservatively on first observation.
+$legacyRetentionInvoice = new FakeAmemberInvoice();
+$legacyRetentionPayload = v2Payload('delivery-legacy-retention', 1, 1);
+$legacyRetentionRawBody = json_encode($legacyRetentionPayload, JSON_THROW_ON_ERROR);
+$legacyRetentionTransactionKey = hash('sha256', 'transaction-123');
+$legacyRetentionDeliveryKey = hash('sha256', 'delivery-legacy-retention');
+$legacyRetentionInvoice->seedPersistedV2State(array(
+    'formatVersion' => 1,
+    'highestEventVersions' => array($legacyRetentionTransactionKey => 1),
+    'eventSemanticHashes' => array(
+        $legacyRetentionTransactionKey => array(
+            '1' => hash('sha256', "payment-gateway-app-ipn-v2-semantic-v1\0status\0" . '1'),
+        ),
+    ),
+    'deliveries' => array(
+        $legacyRetentionDeliveryKey => array(
+            'transactionKey' => $legacyRetentionTransactionKey,
+            'eventVersion' => 1,
+            'bodyHash' => hash('sha256', $legacyRetentionRawBody),
+            'phase' => 'applied',
+        ),
+    ),
+));
+$legacyRetentionEffects = 0;
+$legacyRetentionResult = processV2StateAt(
+    $legacyRetentionInvoice,
+    $retentionDb,
+    $legacyRetentionPayload,
+    $retentionStart,
+    true,
+    $legacyRetentionEffects
+);
+$legacyRetentionState = persistedV2State($legacyRetentionInvoice);
+ipnV2AssertSame('duplicate', $legacyRetentionResult, 'A legacy applied claim must remain duplicate-safe during retention migration.');
+ipnV2AssertSame(0, $legacyRetentionEffects, 'Retention migration must not repeat a legacy applied effect.');
+ipnV2AssertSame(
+    $retentionStart,
+    $legacyRetentionState['deliveries'][$legacyRetentionDeliveryKey]['firstSeenAt'] ?? null,
+    'A legacy delivery must receive a full safe horizon from its first post-upgrade observation.'
+);
+ipnV2AssertSame(
+    $retentionStart,
+    $legacyRetentionState['transactionSeenAt'][$legacyRetentionTransactionKey] ?? null,
+    'Legacy transaction ordering state must receive the same conservative migration horizon.'
+);
+
+for ($index = 0; $index < 100; $index++) {
+    $payload = v2Payload('delivery-retention-' . $index, 1, 1);
+    $payload['id'] = 'transaction-retention-' . $index;
+    $retentionPayloads[$index] = $payload;
+    try {
+        processV2StateAt(
+            $retentionInvoice,
+            $retentionDb,
+            $payload,
+            $retentionStart,
+            $index % 2 === 0,
+            $retentionEffects
+        );
+    } catch (Am_Exception_Paysystem $error) {
+        ipnV2AssertSame(
+            true,
+            $index % 2 === 1 && str_contains($error->getMessage(), 'prerequisite'),
+            'Only intentionally pending retention fixtures may fail their effect prerequisite.'
+        );
+    }
+}
+$effectsBeforeDuplicate = $retentionEffects;
+$duplicateWithinWindow = processV2StateAt(
+    $retentionInvoice,
+    $retentionDb,
+    $retentionPayloads[0],
+    $retentionStart + (48 * 3600),
+    true,
+    $retentionEffects
+);
+ipnV2AssertSame('duplicate', $duplicateWithinWindow, 'An applied claim must retain replay protection through the retry window.');
+ipnV2AssertSame($effectsBeforeDuplicate, $retentionEffects, 'An under-window duplicate must not repeat its effect.');
+
+$pendingRecoveryWithinWindow = processV2StateAt(
+    $retentionInvoice,
+    $retentionDb,
+    $retentionPayloads[1],
+    $retentionStart + (49 * 3600) - 1,
+    true,
+    $retentionEffects
+);
+ipnV2AssertSame('applied', $pendingRecoveryWithinWindow, 'A pending claim must remain recoverable through the safety margin.');
+
+$overflowPayload = v2Payload('delivery-retention-overflow', 1, 1);
+$overflowPayload['id'] = 'transaction-retention-overflow';
+$underWindowCapacityRejected = false;
+try {
+    processV2StateAt(
+        $retentionInvoice,
+        $retentionDb,
+        $overflowPayload,
+        $retentionStart + (49 * 3600) - 1,
+        true,
+        $retentionEffects
+    );
+} catch (Am_Exception_Paysystem $error) {
+    $underWindowCapacityRejected = str_contains($error->getMessage(), 'capacity');
+}
+$underWindowRetentionState = persistedV2State($retentionInvoice);
+ipnV2AssertSame(true, $underWindowCapacityRejected, 'A full protected window must reject a new claim instead of evicting a live one.');
+ipnV2AssertSame(100, count($underWindowRetentionState['deliveries'] ?? array()), 'Protected mixed claims must remain strictly count-bounded.');
+ipnV2AssertTrue(
+    isset($underWindowRetentionState['deliveries'][hash('sha256', 'delivery-retention-99')]),
+    'The newest pending claim must not be evicted while it remains recoverable.'
+);
+
+$overWindowResult = processV2StateAt(
+    $retentionInvoice,
+    $retentionDb,
+    $overflowPayload,
+    $retentionStart + (49 * 3600) + 1,
+    true,
+    $retentionEffects
+);
+$overWindowRetentionState = persistedV2State($retentionInvoice);
+ipnV2AssertSame('applied', $overWindowResult, 'Expired claims may be compacted after the retry window and safety margin.');
+ipnV2AssertTrue(
+    count($overWindowRetentionState['deliveries'] ?? array()) <= 100,
+    'Delivery retention must remain count-bounded after over-window compaction.'
+);
+ipnV2AssertTrue(
+    count($overWindowRetentionState['highestEventVersions'] ?? array()) <= 100
+        && count($overWindowRetentionState['eventSemanticHashes'] ?? array()) <= 100,
+    'Transaction high-water and semantic maps must compact with expired delivery claims.'
+);
+$expiredTransactionKey = hash('sha256', 'transaction-retention-99');
+ipnV2AssertSame(
+    false,
+    isset($overWindowRetentionState['highestEventVersions'][$expiredTransactionKey])
+        || isset($overWindowRetentionState['eventSemanticHashes'][$expiredTransactionKey])
+        || isset($overWindowRetentionState['transactionSeenAt'][$expiredTransactionKey]),
+    'Expired transaction ordering and semantic retention metadata must be removed together.'
+);
+ipnV2AssertSame(
+    false,
+    isset($overWindowRetentionState['deliveries'][hash('sha256', 'delivery-retention-99')]),
+    'An over-window pending claim may be removed only after its recovery horizon has elapsed.'
+);
 
 // Invalid statuses are rejected before deduplication or highest-version state can advance.
 $invalidStatusInvoice = new FakeAmemberInvoice();
