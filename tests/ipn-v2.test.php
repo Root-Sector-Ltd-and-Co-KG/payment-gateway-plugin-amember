@@ -304,6 +304,12 @@ final class FakeAmemberInvoice
         );
         $this->data->update();
     }
+
+    public function seedCheckoutAttempt(string $sessionPublicId): void
+    {
+        $this->data->set(PaymentGatewayAppCheckoutAttempt::STATE_DATA_KEY, $sessionPublicId);
+        $this->data->update();
+    }
 }
 
 /** @var list<string> $failures */
@@ -428,6 +434,79 @@ $now = time();
 $trace = array();
 $di = (object)array('db' => new FakeAmemberDb($trace));
 $plugin = new Am_Paysystem_PaymentGatewayApp(array('webhook_secret' => $secret), $di);
+
+foreach (array(0, -2, 2, 1) as $staleStatus) {
+    foreach (array('1', '2') as $attemptVersion) {
+        $staleInvoice = new FakeAmemberInvoice();
+        $staleInvoice->seedCheckoutAttempt('session-attempt-b');
+        $stalePayload = $attemptVersion === '2'
+            ? v2Payload('delivery-stale-' . $staleStatus, 1, $staleStatus)
+            : array(
+                'id' => 'transaction-attempt-a-' . $staleStatus,
+                'externalReference' => 'invoice-42',
+                'status' => $staleStatus,
+            );
+        $stalePayload['sessionPublicId'] = 'session-attempt-a';
+        $staleResult = executeIpn(
+            $plugin,
+            $staleInvoice,
+            $stalePayload,
+            $now,
+            $attemptVersion === '2' ? '2' : null,
+            $attemptVersion === '2' ? $stalePayload['deliveryId'] : null
+        );
+        ipnV2AssertSame(true, $staleResult['accepted'], 'A stale signed v' . $attemptVersion . ' attempt event must be acknowledged.');
+        ipnV2AssertSame('OK', $staleResult['output'], 'A stale signed v' . $attemptVersion . ' attempt event must receive the normal acknowledgement.');
+        ipnV2AssertSame(array(), $staleInvoice->effects, 'A stale pending/cancel/fail/success event must not affect the current invoice attempt.');
+    }
+}
+
+$invalidAttemptInvoice = new FakeAmemberInvoice();
+$invalidAttemptPayload = v2Payload('delivery-invalid-attempt', 1, 1);
+$invalidAttemptPayload['sessionPublicId'] = str_repeat('a', 129);
+$invalidAttemptResult = executeIpn(
+    $plugin,
+    $invalidAttemptInvoice,
+    $invalidAttemptPayload,
+    $now,
+    '2',
+    'delivery-invalid-attempt'
+);
+ipnV2AssertSame(false, $invalidAttemptResult['accepted'], 'An oversized signed attempt identity must be rejected before effects.');
+
+$invalidV1AttemptInvoice = new FakeAmemberInvoice();
+$invalidV1AttemptResult = executeIpn(
+    $plugin,
+    $invalidV1AttemptInvoice,
+    array(
+        'id' => 'transaction-invalid-v1-attempt',
+        'externalReference' => 'invoice-42',
+        'sessionPublicId' => array('not' => 'scalar'),
+        'status' => 1,
+    ),
+    $now,
+    null,
+    null
+);
+ipnV2AssertSame(false, $invalidV1AttemptResult['accepted'], 'A malformed signed v1 attempt identity must also be rejected before effects.');
+
+foreach (array('1', '2') as $omittedVersion) {
+    $omittedInvoice = new FakeAmemberInvoice();
+    $omittedInvoice->seedCheckoutAttempt('session-attempt-b');
+    $omittedPayload = $omittedVersion === '2'
+        ? v2Payload('delivery-omitted-attempt', 1, 1)
+        : array('id' => 'transaction-legacy', 'externalReference' => 'invoice-42', 'status' => 1);
+    $omittedResult = executeIpn(
+        $plugin,
+        $omittedInvoice,
+        $omittedPayload,
+        $now,
+        $omittedVersion === '2' ? '2' : null,
+        $omittedVersion === '2' ? $omittedPayload['deliveryId'] : null
+    );
+    ipnV2AssertSame(true, $omittedResult['accepted'], 'An older signed v' . $omittedVersion . ' sender omitting attempt identity must remain compatible.');
+    ipnV2AssertSame(array('payment'), $omittedInvoice->effects, 'Omitted-field compatibility must preserve the existing payment effect.');
+}
 
 // A correctly signed v2 event accepts an opaque delivery ID and persists its claim before payment.
 $validInvoice = new FakeAmemberInvoice();

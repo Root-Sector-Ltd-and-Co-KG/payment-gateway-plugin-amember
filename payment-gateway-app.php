@@ -158,6 +158,49 @@ final class PaymentGatewayAppApiErrorContext
     }
 }
 
+final class PaymentGatewayAppCheckoutAttempt
+{
+    const STATE_DATA_KEY = 'payment_gateway_app_session_public_id';
+    const MAX_IDENTIFIER_LENGTH = 128;
+
+    public static function validIdentifier($value)
+    {
+        return is_string($value)
+            && $value !== ''
+            && strlen($value) <= self::MAX_IDENTIFIER_LENGTH
+            && preg_match('/\A[A-Za-z0-9._:-]+\z/', $value) === 1;
+    }
+
+    public static function persistFromCheckoutResponse($invoice, array $responseBody)
+    {
+        if (!array_key_exists('sessionPublicId', $responseBody)) {
+            return 'omitted';
+        }
+        if (!self::validIdentifier($responseBody['sessionPublicId'])) {
+            return 'invalid';
+        }
+        $invoice->data()->set(self::STATE_DATA_KEY, $responseBody['sessionPublicId']);
+        $invoice->data()->update();
+        return 'persisted';
+    }
+
+    public static function matchesSignedEvent($invoice, array $payload)
+    {
+        if (!array_key_exists('sessionPublicId', $payload)) {
+            return true;
+        }
+        $eventAttempt = $payload['sessionPublicId'];
+        if (!self::validIdentifier($eventAttempt)) {
+            return false;
+        }
+        $currentAttempt = $invoice->data()->get(self::STATE_DATA_KEY);
+        if (!self::validIdentifier($currentAttempt)) {
+            return true;
+        }
+        return hash_equals((string)$currentAttempt, (string)$eventAttempt);
+    }
+}
+
 class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
 {
     const PLUGIN_STATUS = self::STATUS_PRODUCTION;
@@ -352,6 +395,12 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
             $errorDetails = $responseErrorDetails;
             $this->logGatewayApiError($errorDetails);
             $result->setFailed('Payment session creation failed. Reason: ' . $this->formatCustomerApiError($errorDetails, 'missing paymentUrl in response'));
+            return;
+        }
+
+        $attemptPersistence = PaymentGatewayAppCheckoutAttempt::persistFromCheckoutResponse($invoice, $responseBody);
+        if ($attemptPersistence === 'invalid') {
+            $result->setFailed('Payment session creation failed due to an invalid gateway response.');
             return;
         }
 
@@ -659,11 +708,14 @@ final class PaymentGatewayAppIpnV2State
 
     private static function semanticEventHash(array $payload)
     {
-        // V2 effect selection is entirely status-driven; retry metadata and legacy dispute aliases are inert.
-        return hash(
-            'sha256',
-            "payment-gateway-app-ipn-v2-semantic-v1\0status\0" . (string)$payload['status']
-        );
+        $sessionPublicId = isset($payload['sessionPublicId']) && is_string($payload['sessionPublicId'])
+            ? $payload['sessionPublicId']
+            : '';
+        $material = "payment-gateway-app-ipn-v2-semantic-v1\0status\0" . (string)$payload['status'];
+        if ($sessionPublicId !== '') {
+            $material .= "\0sessionPublicId\0" . $sessionPublicId;
+        }
+        return hash('sha256', $material);
     }
 
     private static function saveState($invoice, array $state)
@@ -1009,6 +1061,16 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     private function validateIpnVersion()
     {
+        if (
+            array_key_exists('sessionPublicId', $this->parsedRequest)
+            && !PaymentGatewayAppCheckoutAttempt::validIdentifier($this->parsedRequest['sessionPublicId'])
+        ) {
+            $this->getPlugin()->logError(
+                'IPN: Invalid signed checkout attempt identity.',
+                $this->getSafeWebhookLogContext(array('reason' => 'invalid_session_public_id'))
+            );
+            throw new Am_Exception_Paysystem('Invalid signed checkout attempt identity');
+        }
         $versionHeader = $this->request->getHeader('X-IPN-Version');
         $versionHeader = is_scalar($versionHeader) ? trim((string)$versionHeader) : '';
 
@@ -1204,6 +1266,11 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
 
     public function processValidated()
     {
+        if (!PaymentGatewayAppCheckoutAttempt::matchesSignedEvent($this->invoice, $this->parsedRequest)) {
+            echo "OK";
+            http_response_code(200);
+            return;
+        }
         if ($this->ipnVersion === 2) {
             PaymentGatewayAppIpnV2State::process(
                 $this->invoice,
