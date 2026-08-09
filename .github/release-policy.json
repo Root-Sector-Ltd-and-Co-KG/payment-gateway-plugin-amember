@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "defaultBranch": "main",
+  "workflowPath": ".github/workflows/phpreleaser.yml",
+  "policy": {
+    "id": "amember-plugin-release-v1",
+    "path": "scripts/validate-release-policy.mjs"
+  },
+  "releases": {
+    "1.2.0": {
+      "sourceRevision": "c3086653cdccc6ebeb62730ab03567942a1b3ff4",
+      "artifactName": "payment-gateway-app_v1.2.0.zip",
+      "archiveRoot": "payment-gateway-app",
+      "prepareScript": "scripts/prepare-release.php",
+      "changelogFile": "README.md",
+      "changelogHeading": "### 1.2.0",
+      "releaseNotesFile": "RELEASE.md"
+    }
+  }
+}

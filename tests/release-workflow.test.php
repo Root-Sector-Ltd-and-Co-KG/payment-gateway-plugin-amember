@@ -73,15 +73,20 @@ try {
     releaseAssertContains('workflow_dispatch:', $workflow, 'Publication must require a manual pre-tag dispatch.');
     releaseAssertContains('source_sha:', $workflow, 'Publication must select an exact reviewed source commit.');
     releaseAssertContains('PLUGIN_RELEASE_VERSION: ${{ inputs.version', $workflow, 'Publication must use the selected semantic version.');
+    releaseAssertContains('refs/heads/main', $workflow, 'Publication must execute from the protected default branch.');
+    releaseAssertContains('github.ref_protected', $workflow, 'Publication must require GitHub to identify the workflow ref as protected.');
+    releaseAssertContains('.github/release-policy.json', $workflow, 'Publication must use the trusted repository release manifest.');
     releaseAssertContains("permissions:\n  contents: read", $workflow, 'The workflow default must be read-only.');
     releaseAssertContains('needs: validate', $workflow, 'Publication must depend on successful validation.');
     releaseAssertContains("permissions:\n      contents: write", $workflow, 'Only publication may write repository contents.');
     releaseAssertContains('php tests/ipn-v2.test.php', $workflow, 'The release workflow must execute the IPN v2 receiver regression before packaging.');
     releaseAssertNotContains('payment-gateway-release-orchestrator/', $workflow, 'A public plugin workflow must not import the private release orchestrator.');
     releaseAssertContains('scripts/validate-release-policy.mjs', $workflow, 'Publication must run the repository-local SemVer policy.');
-    releaseAssertContains('payment-gateway-app_v${{ inputs.version }}.zip', $workflow, 'The archive filename must include the selected version.');
+    releaseAssertContains('.releases[$version].artifactName', $workflow, 'The archive filename must come from the trusted release manifest.');
     releaseAssertContains('sha256sum', $workflow, 'Publication must create an exact SHA-256 checksum asset.');
-    releaseAssertContains('gh release create', $workflow, 'Publication must create a new immutable release.');
+    releaseAssertContains('scripts/publish-release.mjs', $workflow, 'Publication must verify a resumable draft before making the release visible.');
+    releaseAssertContains('persist-credentials: false', $workflow, 'Publication checkouts must not retain write credentials.');
+    releaseAssertContains('release-control/$PREPARE_SCRIPT', $workflow, 'Packaging must use the trusted control-tree packager.');
     releaseAssertNotContains('--clobber', $workflow, 'Publication must never replace a release asset.');
 
     $sourceReadme = file_get_contents(dirname(__DIR__) . '/README.md');
