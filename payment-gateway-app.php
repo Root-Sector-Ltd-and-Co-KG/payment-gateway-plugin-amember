@@ -507,6 +507,16 @@ final class PaymentGatewayAppIpnV2State
     const RETRY_WINDOW_SECONDS = 48 * 3600;
     const RETENTION_SAFETY_SECONDS = 3600;
 
+    // Called only after signature validation, while holding the invoice lock.
+    public static function hasAcceptedTransaction($invoice, $transactionId, array $payload)
+    {
+        $state = self::loadState($invoice->data()->get(self::STATE_DATA_KEY));
+        $transactionKey = hash('sha256', (string)$transactionId);
+        $sessionKey = isset($payload['sessionPublicId']) ? hash('sha256', $payload['sessionPublicId']) : '';
+        return !empty($state['highestEventVersions'][$transactionKey])
+            || ($sessionKey !== '' && !empty($state['acceptedSessions'][$sessionKey]));
+    }
+
     public static function process(
         $invoice,
         $db,
@@ -556,6 +566,16 @@ final class PaymentGatewayAppIpnV2State
                 $phase = isset($delivery['phase']) ? (string)$delivery['phase'] : 'pending';
             }
 
+            // The latest effect receipt survives delivery-history compaction.
+            $receipt = isset($state['effectReceipts'][$transactionKey]) ? $state['effectReceipts'][$transactionKey] : null;
+            if ($delivery === null && $receipt !== null && $receipt['deliveryKey'] === $deliveryKey) {
+                if ((int)$receipt['eventVersion'] !== $eventVersion || !hash_equals($receipt['bodyHash'], $bodyHash)) {
+                    throw new Am_Exception_Paysystem('Conflicting IPN v2 delivery identity');
+                }
+                $delivery = $receipt;
+                $phase = $receipt['phase'];
+            }
+
             $highestEventVersion = isset($state['highestEventVersions'][$transactionKey])
                 ? (int)$state['highestEventVersions'][$transactionKey]
                 : 0;
@@ -591,7 +611,9 @@ final class PaymentGatewayAppIpnV2State
                 return 'outdated';
             }
             if ($delivery === null && $eventVersion === $highestEventVersion) {
-                $recoverableEffect = false;
+                $recoverableEffect = $receipt !== null
+                    && (int)$receipt['eventVersion'] === $eventVersion
+                    && $receipt['phase'] === 'effecting';
                 foreach ($state['deliveries'] as $knownDelivery) {
                     if (
                         isset($knownDelivery['transactionKey'], $knownDelivery['eventVersion'], $knownDelivery['phase'])
@@ -610,7 +632,11 @@ final class PaymentGatewayAppIpnV2State
                     return 'outdated';
                 }
             }
-            if ($delivery === null && count($state['deliveries']) >= self::MAX_RETAINED_DELIVERIES) {
+            if (
+                !isset($state['deliveries'][$deliveryKey])
+                && ($delivery === null || $phase === 'effecting')
+                && count($state['deliveries']) >= self::MAX_RETAINED_DELIVERIES
+            ) {
                 throw new Am_Exception_Paysystem('IPN v2 receiver state is at protected capacity');
             }
             if ($storedSemanticHash === null) {
@@ -643,7 +669,7 @@ final class PaymentGatewayAppIpnV2State
                 self::saveState($invoice, $state);
                 return 'outdated';
             }
-            if ($delivery === null) {
+            if (!isset($state['deliveries'][$deliveryKey])) {
                 $state['deliveries'][$deliveryKey] = array(
                     'transactionKey' => $transactionKey,
                     'eventVersion' => $eventVersion,
@@ -677,6 +703,10 @@ final class PaymentGatewayAppIpnV2State
                 $highestEventVersion,
                 $eventVersion
             );
+            $state['effectReceipts'][$transactionKey] = $state['deliveries'][$deliveryKey] + array('deliveryKey' => $deliveryKey);
+            if (isset($payload['sessionPublicId'])) {
+                $state['acceptedSessions'][hash('sha256', $payload['sessionPublicId'])] = true;
+            }
             self::saveState($invoice, $state);
 
             if ($applyEffect() !== true) {
@@ -689,6 +719,7 @@ final class PaymentGatewayAppIpnV2State
                 throw new Am_Exception_Paysystem('IPN v2 delivery state disappeared');
             }
             $state['deliveries'][$deliveryKey]['phase'] = 'applied';
+            $state['effectReceipts'][$transactionKey]['phase'] = 'applied';
             $state = self::maintainRetention($state, $receivedAt);
             self::saveState($invoice, $state);
             return 'applied';
@@ -705,6 +736,8 @@ final class PaymentGatewayAppIpnV2State
                 'highestEventVersions' => array(),
                 'eventSemanticHashes' => array(),
                 'transactionSeenAt' => array(),
+                'effectReceipts' => array(),
+                'acceptedSessions' => array(),
                 'deliveries' => array(),
             );
         }
@@ -730,6 +763,14 @@ final class PaymentGatewayAppIpnV2State
         }
         if (!is_array($state['transactionSeenAt'])) {
             throw new Am_Exception_Paysystem('Invalid persisted IPN v2 transaction retention state');
+        }
+        foreach (array('effectReceipts', 'acceptedSessions') as $key) {
+            if (!isset($state[$key])) {
+                $state[$key] = array();
+            }
+            if (!is_array($state[$key])) {
+                throw new Am_Exception_Paysystem('Invalid persisted IPN v2 receipt state');
+            }
         }
         return $state;
     }
@@ -785,6 +826,15 @@ final class PaymentGatewayAppIpnV2State
             if (!is_int($delivery['firstSeenAt']) || $delivery['firstSeenAt'] <= 0) {
                 throw new Am_Exception_Paysystem('Invalid persisted IPN v2 delivery retention time');
             }
+            $transactionKey = isset($delivery['transactionKey']) ? (string)$delivery['transactionKey'] : '';
+            if (
+                isset($delivery['eventVersion'], $delivery['phase'], $state['highestEventVersions'][$transactionKey])
+                && (int)$delivery['eventVersion'] === (int)$state['highestEventVersions'][$transactionKey]
+                && in_array($delivery['phase'], array('effecting', 'applied'), true)
+                && (!isset($state['effectReceipts'][$transactionKey]) || $state['effectReceipts'][$transactionKey]['phase'] !== 'applied')
+            ) {
+                $state['effectReceipts'][$transactionKey] = $delivery + array('deliveryKey' => $deliveryKey);
+            }
             if ($delivery['firstSeenAt'] < $cutoff) {
                 unset($state['deliveries'][$deliveryKey]);
             }
@@ -804,15 +854,7 @@ final class PaymentGatewayAppIpnV2State
             $retainedVersions[$transactionKey][$eventVersionKey] = true;
         }
 
-        foreach ($state['highestEventVersions'] as $transactionKey => $unusedHighestEventVersion) {
-            $transactionKey = (string)$transactionKey;
-            $seenAt = isset($state['transactionSeenAt'][$transactionKey])
-                ? (int)$state['transactionSeenAt'][$transactionKey]
-                : (int)$receivedAt;
-            if (!isset($retainedVersions[$transactionKey]) && $seenAt < $cutoff) {
-                unset($state['highestEventVersions'][$transactionKey]);
-            }
-        }
+        // Transaction watermarks and latest effect semantics live as long as the invoice.
         foreach ($state['eventSemanticHashes'] as $transactionKey => &$semanticHashes) {
             if (!is_array($semanticHashes)) {
                 throw new Am_Exception_Paysystem('Invalid persisted IPN v2 event semantics');
@@ -1308,19 +1350,27 @@ class Am_Paysystem_Transaction_PaymentGatewayApp extends Am_Paysystem_Transactio
             return;
         }
 
+        $this->processLegacyV1();
+        echo "OK";
+        http_response_code(200);
+    }
+
+    // PG-242: remove this adapter when v1 delivery and manual replay are retired.
+    private function processLegacyV1()
+    {
         $db = $this->getPlugin()->getDi()->db;
         $lockName = PaymentGatewayAppInvoiceSynchronization::acquire($this->invoice, $db);
         try {
             $this->invoice->refresh();
-            if (PaymentGatewayAppCheckoutAttempt::matchesSignedEvent($this->invoice, $this->parsedRequest)) {
+            if (
+                PaymentGatewayAppCheckoutAttempt::matchesSignedEvent($this->invoice, $this->parsedRequest)
+                && !PaymentGatewayAppIpnV2State::hasAcceptedTransaction($this->invoice, $this->getGatewayTransactionId(), $this->parsedRequest)
+            ) {
                 $this->applyPaymentEffect();
             }
         } finally {
             PaymentGatewayAppInvoiceSynchronization::release($db, $lockName);
         }
-        // Send HTTP 200 response with "OK" body
-        echo "OK";
-        http_response_code(200);
     }
 
     private function isPaymentEffectReady()

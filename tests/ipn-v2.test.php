@@ -1047,6 +1047,112 @@ ipnV2AssertSame(true, $newerResult['accepted'], 'The newer v2 event must be acce
 ipnV2AssertSame(true, $staleResult['accepted'], 'A stale v2 event must be acknowledged successfully.');
 ipnV2AssertSame(array('payment'), $orderedInvoice->effects, 'A stale failed event must not regress a paid invoice.');
 
+// MIG-001: a signed legacy delivery cannot undo an accepted v2 transaction/session.
+foreach (array(null, 'session-migration') as $migrationSession) {
+    $migrationInvoice = new FakeAmemberInvoice();
+    $migrationPaid = v2Payload('migration-paid', 2, 1);
+    if ($migrationSession !== null) {
+        $migrationInvoice->seedCheckoutAttempt($migrationSession);
+        $migrationPaid['sessionPublicId'] = $migrationSession;
+    }
+    executeIpn($plugin, $migrationInvoice, $migrationPaid, $now, '2', 'migration-paid');
+    foreach (array(2, 3, 4) as $legacyStatus) {
+        $legacyFailure = array('id' => 'transaction-123', 'externalReference' => 'invoice-42', 'status' => $legacyStatus);
+        if ($migrationSession !== null) {
+            $legacyFailure['sessionPublicId'] = $migrationSession;
+        }
+        $migrationResult = executeIpn($plugin, $migrationInvoice, $legacyFailure, $now, null, null);
+        ipnV2AssertSame(true, $migrationResult['accepted'], 'MIG-001: signed stale v1 must be acknowledged.');
+    }
+    ipnV2AssertSame(array('payment'), $migrationInvoice->effects, 'MIG-001: v1 must not undo the same v2 transaction.');
+    $migrationRefund = array_merge($migrationPaid, array('deliveryId' => 'migration-refund', 'eventVersion' => 3, 'status' => 3));
+    executeIpn($plugin, $migrationInvoice, $migrationRefund, $now, '2', 'migration-refund');
+    ipnV2AssertSame(array('payment', 'refund'), $migrationInvoice->effects, 'A newer v2 refund remains legitimate after suppressing v1.');
+}
+
+// The fence covers a session even when legacy aliases select another transaction,
+// but it must not disable a later, genuinely distinct legacy checkout.
+$sessionFenceInvoice = new FakeAmemberInvoice();
+$sessionFenceInvoice->seedCheckoutAttempt('migration-session-a');
+$sessionFencePayload = v2Payload('session-fence', 1, 0);
+$sessionFencePayload['sessionPublicId'] = 'migration-session-a';
+executeIpn($plugin, $sessionFenceInvoice, $sessionFencePayload, $now, '2', 'session-fence');
+$sessionLegacy = array('id' => 'legacy-other-id', 'externalReference' => 'invoice-42', 'sessionPublicId' => 'migration-session-a', 'status' => 1);
+executeIpn($plugin, $sessionFenceInvoice, $sessionLegacy, $now, '1', null);
+ipnV2AssertSame(array(), $sessionFenceInvoice->effects, 'A v1 event on an accepted v2 session must not bypass the fence with another transaction ID.');
+$sessionFenceInvoice->seedCheckoutAttempt('migration-session-b');
+$sessionLegacy['sessionPublicId'] = 'migration-session-b';
+executeIpn($plugin, $sessionFenceInvoice, $sessionLegacy, $now, '1', null);
+ipnV2AssertSame(array('payment'), $sessionFenceInvoice->effects, 'A fresh checkout may still use v1 after another session used v2.');
+
+// MIG-002: a re-signed manual replay after history retention still obeys ordering.
+foreach (array(48, 50, 24 * 365) as $ageHours) {
+    $agedInvoice = new FakeAmemberInvoice();
+    $agedPaid = v2Payload('aged-paid', 2, 1);
+    executeIpn($plugin, $agedInvoice, $agedPaid, $now, '2', 'aged-paid');
+    $agedState = persistedV2State($agedInvoice);
+    foreach ($agedState['deliveries'] as &$claim) { $claim['firstSeenAt'] = time() - $ageHours * 3600; }
+    unset($claim);
+    foreach ($agedState['transactionSeenAt'] as &$seenAt) { $seenAt = time() - $ageHours * 3600; }
+    unset($seenAt);
+    $agedInvoice->seedPersistedV2State($agedState);
+    $agedFailure = v2Payload('aged-failure', 1, 2);
+    $agedResult = executeIpn($plugin, $agedInvoice, $agedFailure, $now, '2', 'aged-failure');
+    ipnV2AssertSame(true, $agedResult['accepted'], 'MIG-002: stale manual replay must be acknowledged after ' . $ageHours . 'h.');
+    ipnV2AssertSame(array('payment'), $agedInvoice->effects, 'MIG-002: stale manual replay must not void payment after ' . $ageHours . 'h.');
+    executeIpn($plugin, $agedInvoice, $agedPaid, $now, '2', 'aged-paid');
+    ipnV2AssertSame(array('payment'), $agedInvoice->effects, 'An expired duplicate paid delivery must remain effect-free.');
+}
+
+// A partial payment receipt must still recover after delivery-history expiry.
+$agedPartialInvoice = new FakeAmemberInvoice();
+$agedPartialInvoice->postEffectRefreshFailuresRemaining = 1;
+$agedPartial = v2Payload('aged-partial', 2, 1);
+$agedPartialFirst = executeIpn($plugin, $agedPartialInvoice, $agedPartial, $now, '2', 'aged-partial');
+ipnV2AssertSame(false, $agedPartialFirst['accepted'], 'The partial-effect fixture must interrupt acknowledgement.');
+$agedPartialState = persistedV2State($agedPartialInvoice);
+foreach ($agedPartialState['deliveries'] as &$claim) { $claim['firstSeenAt'] = time() - 50 * 3600; }
+unset($claim);
+foreach ($agedPartialState['transactionSeenAt'] as &$seenAt) { $seenAt = time() - 50 * 3600; }
+unset($seenAt);
+$agedPartialInvoice->seedPersistedV2State($agedPartialState);
+$agedPartialRetry = executeIpn($plugin, $agedPartialInvoice, $agedPartial, $now, '2', 'aged-partial');
+ipnV2AssertSame(true, $agedPartialRetry['accepted'], 'Post-retention manual replay must finish a partial payment.');
+ipnV2AssertSame(array('payment'), $agedPartialInvoice->effects, 'Post-retention recovery must not repeat a receipt effect.');
+
+// An effect that never completed must recover even after its delivery history expires.
+$failedAgedInvoice = new FakeAmemberInvoice();
+$failedAgedInvoice->paymentFailuresRemaining = 1;
+$failedAgedPayload = v2Payload('failed-aged', 4, 1);
+executeIpn($plugin, $failedAgedInvoice, $failedAgedPayload, $now, '2', 'failed-aged');
+$failedAgedState = persistedV2State($failedAgedInvoice);
+foreach ($failedAgedState['deliveries'] as &$claim) { $claim['firstSeenAt'] = time() - 50 * 3600; }
+unset($claim);
+$failedAgedInvoice->seedPersistedV2State($failedAgedState);
+$failedAgedRetry = executeIpn($plugin, $failedAgedInvoice, $failedAgedPayload, $now, '2', 'failed-aged');
+ipnV2AssertSame(true, $failedAgedRetry['accepted'], 'An uncompleted effect remains recoverable after retention.');
+ipnV2AssertSame(array('payment'), $failedAgedInvoice->effects, 'The retained effect receipt must resume an uncompleted payment.');
+
+// Resuming a compact receipt must respect the protected delivery capacity too.
+$capacityInvoice = new FakeAmemberInvoice();
+$capacityInvoice->paymentFailuresRemaining = 1;
+$capacityPayload = v2Payload('capacity-recovery', 4, 1);
+executeIpn($plugin, $capacityInvoice, $capacityPayload, $now, '2', 'capacity-recovery');
+$capacityState = persistedV2State($capacityInvoice);
+foreach ($capacityState['deliveries'] as &$claim) { $claim['firstSeenAt'] = time() - 50 * 3600; }
+unset($claim);
+$capacityInvoice->seedPersistedV2State($capacityState);
+$capacityEffects = 0;
+for ($index = 0; $index < 100; $index++) {
+    $capacityOther = v2Payload('capacity-other-' . $index, 1, 0);
+    $capacityOther['id'] = 'capacity-other-' . $index;
+    processV2StateAt($capacityInvoice, $di->db, $capacityOther, time(), true, $capacityEffects);
+}
+$capacityRetry = executeIpn($plugin, $capacityInvoice, $capacityPayload, $now, '2', 'capacity-recovery');
+ipnV2AssertSame(false, $capacityRetry['accepted'], 'A compact receipt must wait when delivery capacity is protected.');
+ipnV2AssertSame(array(), $capacityInvoice->effects, 'Capacity rejection must not run a partial effect.');
+ipnV2AssertSame(100, count(persistedV2State($capacityInvoice)['deliveries']), 'Receipt recovery must never overflow bounded delivery history.');
+
 // Retention keeps every recoverable/replay claim through 48 hours plus one hour of safety.
 $retentionInvoice = new FakeAmemberInvoice();
 $retentionTrace = array();
@@ -1181,11 +1287,8 @@ ipnV2AssertTrue(
     count($overWindowRetentionState['deliveries'] ?? array()) <= 100,
     'Delivery retention must remain count-bounded after over-window compaction.'
 );
-ipnV2AssertTrue(
-    count($overWindowRetentionState['highestEventVersions'] ?? array()) <= 100
-        && count($overWindowRetentionState['eventSemanticHashes'] ?? array()) <= 100,
-    'Transaction high-water and semantic maps must compact with expired delivery claims.'
-);
+ipnV2AssertSame(52, count($overWindowRetentionState['highestEventVersions'] ?? array()), 'All accepted transaction watermarks must survive history compaction.');
+ipnV2AssertSame(52, count($overWindowRetentionState['effectReceipts'] ?? array()), 'Keep one compact effect receipt for each accepted transaction.');
 $expiredTransactionKey = hash('sha256', 'transaction-retention-99');
 ipnV2AssertSame(
     false,
