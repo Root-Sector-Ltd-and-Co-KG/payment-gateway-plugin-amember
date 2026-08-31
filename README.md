@@ -61,6 +61,52 @@ request to this URL. Each request includes two signature headers:
 The plugin verifies both headers before processing. Requests with
 invalid or missing signatures are rejected and logged.
 
+Version 1.2.0 adds the IPN v2 receiver used by durable gateway delivery. IPN
+v2 requests include `X-IPN-Version: 2`, `X-IPN-Delivery-ID`, and a signed
+envelope with stable delivery and event identities. Install this plugin before
+selecting v2 for the site. Existing or unversioned sites remain v1; newly
+created sites default to v2. The gateway selects one explicit version per
+site, with no automatic negotiation or dual-send.
+
+Legacy v1 remains supported through **2027-06-30**. This date does not trigger
+automatic shutdown. Keep the old destination URL and signing configuration
+available for existing deliveries and manual retries until their migration is
+complete. Do not downgrade to a plugin that predates v2 support.
+
+Once a transaction or signed checkout session has accepted v2, subsequent v1
+notifications for that identity are acknowledged without effects. Switching a
+site back to v1 therefore applies to fresh checkouts, not an existing v2
+transaction. Use v2 for subsequent refunds or replay on that transaction.
+Distinct new checkout identities can still use v1.
+
+The receiver retains transaction watermarks, the latest effect receipt and
+accepted session identities for the invoice lifetime. Delivery history is
+bounded to 100 entries per invoice and compacted after 48 hours plus one hour
+of safety. History cleanup does not erase ordering or partial-effect recovery.
+Manual retries use a fresh signature over the original immutable notification.
+Never clear receiver state to force a replay.
+
+The signed `ipn.test` readiness control message is **not yet supported by the
+aMember endpoint**. Payment v1/v2 receiver tests do not qualify the native
+aMember request lifecycle. Readiness must not be reported as successful until
+a safe pre-invoice framework hook is verified; a generic `OK` is not proof.
+
+### Maintenance and v1 removal (PG-242)
+
+Payments-platform owns the temporary v1 adapter. PG-242 removes it only after
+legacy sites, queued deliveries and manual-replay obligations are migrated;
+the support date alone is not a removal gate. Delete `processLegacyV1`, v1
+branches in `validateIpnVersion`, legacy identity/dispute parsing and the v1
+compatibility cases in `tests/ipn-v2.test.php` and customer-risk tests. Keep
+`PaymentGatewayAppInvoiceSynchronization`, checkout identity checks, v2
+watermarks/effect receipts and all v2 recovery/ordering tests. Keep persisted
+protection for existing invoices across plugin upgrades.
+
+A later supported wire version gets an explicit validated dispatch branch and
+a narrow adapter; unknown versions fail closed. Reuse invoice synchronization
+and effect protection, and define any ordering transition explicitly. Do not
+wrap v1 in a synthetic v2 envelope or introduce a version registry.
+
 ## Troubleshooting logs
 
 The optional **Enable Debug Logging** setting is off by default. When enabled,
@@ -103,6 +149,13 @@ regenerate it in Payment Gateway App admin -> Sites -> Edit and update
 the value in the aMember plugin settings.
 
 ## Changelog
+
+### 1.2.0
+
+- Enhancement: Add canonical signed IPN v2 envelope validation and durable duplicate/out-of-order delivery handling.
+- Reliability: Recover payment, void, refund, and chargeback effects without duplicating aMember receipts after retries.
+- Migration: Retain IPN v1 compatibility during the published migration window; install this release before enabling IPN v2.
+- CI: Execute the complete IPN v2 receiver regression before packaging a release.
 
 ### 1.1.1
 
