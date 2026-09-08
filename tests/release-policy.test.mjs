@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +10,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const policyPath = path.join(root, "scripts/validate-release-policy.mjs");
 const finalReceiverRevision = "4f6ca202eaf0fb535571b6aa4533392a3a7fa0b3";
+const finalReceiverDigests = {
+  "payment-gateway-app.php": "3d02679daed1591496ac8dbf0ee75bf3603fcb28fe6db2fa30392e67e183e6a3",
+  "README.md": "3772445e5dbd34f9590e7c6db25c1f9e6dac21265a729282a0245f25ccfcd0cf",
+};
 
 test("release policy implementation is repository-local", () => {
   assert.ok(existsSync(policyPath), "scripts/validate-release-policy.mjs must exist");
@@ -71,18 +76,18 @@ test("trusted release manifest binds the protected workflow, policy, source, ver
   }
 });
 
-test("1.2.0 packages the exact final aMember receiver source", () => {
+test("1.2.0 remains bound to its exact immutable receiver package source", () => {
   const manifest = JSON.parse(readFileSync(path.join(root, ".github/release-policy.json"), "utf8"));
   const sourceRevision = manifest.releases["1.2.0"].sourceRevision;
   assert.equal(sourceRevision, finalReceiverRevision);
 
-  const pluginPath = "payment-gateway-app.php";
-  const archive = execFileSync("git", ["-C", root, "archive", sourceRevision, pluginPath]);
-  const archivedPlugin = execFileSync("tar", ["-xOf", "-", pluginPath], {
-    input: archive,
-    encoding: "utf8",
-  });
-  assert.equal(archivedPlugin, readFileSync(path.join(root, pluginPath), "utf8"));
+  for (const [packagePath, expectedDigest] of Object.entries(finalReceiverDigests)) {
+    const archive = execFileSync("git", ["-C", root, "archive", sourceRevision, packagePath]);
+    const archivedSource = execFileSync("tar", ["-xOf", "-", packagePath], {
+      input: archive,
+    });
+    assert.equal(createHash("sha256").update(archivedSource).digest("hex"), expectedDigest);
+  }
 });
 
 test("release policy CLI maps documented kebab-case arguments", async () => {

@@ -82,6 +82,11 @@ class InvoiceRefund
     public const VOID = 2;
 }
 
+class Am_DataFieldStorage
+{
+    public const BLOB_VALUE = '__AMEMBER_BLOB_VALUE__';
+}
+
 require dirname(__DIR__) . '/payment-gateway-app.php';
 
 final class FakeIpnRequest
@@ -131,7 +136,12 @@ final class FakeAmemberDb
 
 final class FakeAmemberData
 {
+    public int $updateFailuresRemaining = 0;
     private array $values = array();
+    private array $blobs = array();
+    private array $persistedValues = array();
+    private array $persistedBlobs = array();
+    private array $loadedKeys = array();
     private array $trace;
 
     public function __construct(array &$trace)
@@ -141,22 +151,80 @@ final class FakeAmemberData
 
     public function get(string $name)
     {
+        $this->loadedKeys[$name] = true;
         return $this->values[$name] ?? null;
     }
 
     public function set(string $name, $value): void
     {
         $this->values[$name] = $value;
+        unset($this->blobs[$name]);
+    }
+
+    public function setBlob(string $name, string $value): void
+    {
+        $this->values[$name] = Am_DataFieldStorage::BLOB_VALUE;
+        $this->blobs[$name] = $value;
+    }
+
+    public function getBlob(string $name)
+    {
+        if (!isset($this->loadedKeys[$name])) {
+            throw new RuntimeException('Blob reads must follow scalar type loading.');
+        }
+        return $this->blobs[$name] ?? null;
     }
 
     public function update(): void
     {
+        if ($this->updateFailuresRemaining > 0) {
+            $this->updateFailuresRemaining--;
+            throw new RuntimeException('simulated state update failure');
+        }
+        foreach ($this->values as $name => $value) {
+            if ($value === Am_DataFieldStorage::BLOB_VALUE) {
+                $this->persistedValues[$name] = Am_DataFieldStorage::BLOB_VALUE;
+                $this->persistedBlobs[$name] = $this->blobs[$name];
+                continue;
+            }
+            $this->persistedValues[$name] = is_string($value) ? substr($value, 0, 255) : $value;
+            unset($this->persistedBlobs[$name]);
+        }
         $this->trace[] = 'state';
+    }
+
+    public function reload(): void
+    {
+        $this->values = $this->persistedValues;
+        $this->blobs = $this->persistedBlobs;
+        $this->loadedKeys = array();
+    }
+
+    public function replacePersistedScalar(string $name, string $value): void
+    {
+        $this->persistedValues[$name] = substr($value, 0, 255);
+        unset($this->persistedBlobs[$name]);
     }
 
     public function values(): array
     {
-        return $this->values;
+        $values = $this->persistedValues;
+        foreach ($values as $name => $value) {
+            if ($value === Am_DataFieldStorage::BLOB_VALUE) {
+                $values[$name] = $this->persistedBlobs[$name];
+            }
+        }
+        return $values;
+    }
+
+    public function storageEvidence(string $name): array
+    {
+        $value = $this->persistedValues[$name] ?? null;
+        return array(
+            'type' => $value === Am_DataFieldStorage::BLOB_VALUE ? 16 : 0,
+            'value' => $value,
+            'blob' => $this->persistedBlobs[$name] ?? null,
+        );
     }
 
 }
@@ -190,12 +258,13 @@ final class FakeAmemberInvoice
     {
         $this->trace[] = 'refresh';
         if ($this->durableCheckoutAttemptOnRefresh !== null) {
-            $this->data->set(
+            $this->data->replacePersistedScalar(
                 PaymentGatewayAppCheckoutAttempt::STATE_DATA_KEY,
                 $this->durableCheckoutAttemptOnRefresh
             );
             $this->durableCheckoutAttemptOnRefresh = null;
         }
+        $this->data->reload();
         if ($this->effects && $this->postEffectRefreshFailuresRemaining > 0) {
             $this->postEffectRefreshFailuresRemaining--;
             throw new RuntimeException('simulated post-effect refresh failure');
@@ -307,11 +376,33 @@ final class FakeAmemberInvoice
 
     public function seedPersistedV2State(array $state): void
     {
-        $this->data->set(
+        $this->data->setBlob(
             PaymentGatewayAppIpnV2State::STATE_DATA_KEY,
             json_encode($state, JSON_THROW_ON_ERROR)
         );
         $this->data->update();
+    }
+
+    public function seedPersistedV2Scalar(string $state): void
+    {
+        $this->data->set(PaymentGatewayAppIpnV2State::STATE_DATA_KEY, $state);
+        $this->data->update();
+    }
+
+    public function seedPersistedV2Blob(string $state): void
+    {
+        $this->data->setBlob(PaymentGatewayAppIpnV2State::STATE_DATA_KEY, $state);
+        $this->data->update();
+    }
+
+    public function v2StorageEvidence(): array
+    {
+        return $this->data->storageEvidence(PaymentGatewayAppIpnV2State::STATE_DATA_KEY);
+    }
+
+    public function failNextStateUpdate(): void
+    {
+        $this->data->updateFailuresRemaining++;
     }
 
     public function seedCheckoutAttempt(string $sessionPublicId): void
@@ -448,6 +539,67 @@ $now = time();
 $trace = array();
 $di = (object)array('db' => new FakeAmemberDb($trace));
 $plugin = new Am_Paysystem_PaymentGatewayApp(array('webhook_secret' => $secret), $di);
+
+// The native data table truncates scalar values at 255 bytes. Receiver state must
+// use the blob field and survive a real cache reload before any effect is accepted.
+$blobPersistenceInvoice = new FakeAmemberInvoice();
+$blobPersistencePayload = v2Payload('delivery-blob-persistence', 1, 1);
+$blobPersistenceResult = executeIpn(
+    $plugin,
+    $blobPersistenceInvoice,
+    $blobPersistencePayload,
+    $now,
+    '2',
+    'delivery-blob-persistence'
+);
+$blobPersistenceEvidence = $blobPersistenceInvoice->v2StorageEvidence();
+ipnV2AssertSame(true, $blobPersistenceResult['accepted'], 'Full receiver state must survive native blob persistence and reload.');
+ipnV2AssertSame(16, $blobPersistenceEvidence['type'], 'Receiver state must use the native blob storage type.');
+ipnV2AssertSame(Am_DataFieldStorage::BLOB_VALUE, $blobPersistenceEvidence['value'], 'Blob state must retain the native scalar sentinel.');
+ipnV2AssertTrue(strlen((string)$blobPersistenceEvidence['blob']) > 255, 'The persisted receiver blob must retain more than the scalar 255-byte limit.');
+$blobPersistenceReplay = executeIpn(
+    $plugin,
+    $blobPersistenceInvoice,
+    $blobPersistencePayload,
+    $now + 1,
+    '2',
+    'delivery-blob-persistence'
+);
+ipnV2AssertSame(true, $blobPersistenceReplay['accepted'], 'A blob-backed duplicate must be acknowledged.');
+ipnV2AssertSame(array('payment'), $blobPersistenceInvoice->effects, 'A blob-backed duplicate must not repeat its payment effect.');
+
+// A valid state written by the pre-fix scalar implementation remains readable,
+// then moves to blob storage on its next successful state change.
+$legacyScalarInvoice = new FakeAmemberInvoice();
+$legacyScalarInvoice->seedPersistedV2Scalar('{"formatVersion":1,"highestEventVersions":[],"deliveries":[]}');
+$legacyScalarPayload = v2Payload('delivery-legacy-scalar', 1, 1);
+$legacyScalarResult = executeIpn($plugin, $legacyScalarInvoice, $legacyScalarPayload, $now, '2', 'delivery-legacy-scalar');
+ipnV2AssertSame(true, $legacyScalarResult['accepted'], 'A valid legacy scalar state must remain compatible.');
+ipnV2AssertSame(16, $legacyScalarInvoice->v2StorageEvidence()['type'], 'A changed legacy scalar state must migrate to blob storage.');
+
+// Truncated/corrupt persisted data must never be reset to empty state or allow an effect.
+$corruptScalarInvoice = new FakeAmemberInvoice();
+$corruptScalar = '{"formatVersion":1,"highestEventVersions":[],"deliveries":[],"padding":"' . str_repeat('x', 300) . '"}';
+$corruptScalarInvoice->seedPersistedV2Scalar($corruptScalar);
+$corruptBefore = $corruptScalarInvoice->v2StorageEvidence();
+$corruptResult = executeIpn($plugin, $corruptScalarInvoice, v2Payload('delivery-corrupt-scalar', 1, 1), $now, '2', 'delivery-corrupt-scalar');
+ipnV2AssertSame(false, $corruptResult['accepted'], 'A truncated scalar state must fail closed.');
+ipnV2AssertSame(array(), $corruptScalarInvoice->effects, 'A truncated scalar state must have no effect.');
+ipnV2AssertSame($corruptBefore, $corruptScalarInvoice->v2StorageEvidence(), 'A truncated scalar state must not be reset or migrated.');
+
+$missingBlobInvoice = new FakeAmemberInvoice();
+$missingBlobInvoice->seedPersistedV2Blob('');
+$missingBlobBefore = $missingBlobInvoice->v2StorageEvidence();
+$missingBlobResult = executeIpn($plugin, $missingBlobInvoice, v2Payload('delivery-missing-blob', 1, 1), $now, '2', 'delivery-missing-blob');
+ipnV2AssertSame(false, $missingBlobResult['accepted'], 'A blob sentinel without blob data must fail closed.');
+ipnV2AssertSame(array(), $missingBlobInvoice->effects, 'A missing blob must have no effect.');
+ipnV2AssertSame($missingBlobBefore, $missingBlobInvoice->v2StorageEvidence(), 'A missing blob must not be reset.');
+
+$failedStateWriteInvoice = new FakeAmemberInvoice();
+$failedStateWriteInvoice->failNextStateUpdate();
+$failedStateWriteResult = executeIpn($plugin, $failedStateWriteInvoice, v2Payload('delivery-state-write-failure', 1, 1), $now, '2', 'delivery-state-write-failure');
+ipnV2AssertSame(false, $failedStateWriteResult['accepted'], 'A failed blob update must reject the delivery.');
+ipnV2AssertSame(array(), $failedStateWriteInvoice->effects, 'A failed blob update must happen before effects.');
 
 // A receiver object may still cache attempt A after checkout B is durable. Event B
 // must reach the shared lock and refresh before attempt identity is decided.
