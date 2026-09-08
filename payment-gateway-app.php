@@ -510,7 +510,7 @@ final class PaymentGatewayAppIpnV2State
     // Called only after signature validation, while holding the invoice lock.
     public static function hasAcceptedTransaction($invoice, $transactionId, array $payload)
     {
-        $state = self::loadState($invoice->data()->get(self::STATE_DATA_KEY));
+        $state = self::readState($invoice);
         $transactionKey = hash('sha256', (string)$transactionId);
         $sessionKey = isset($payload['sessionPublicId']) ? hash('sha256', $payload['sessionPublicId']) : '';
         return !empty($state['highestEventVersions'][$transactionKey])
@@ -535,7 +535,7 @@ final class PaymentGatewayAppIpnV2State
             if (!PaymentGatewayAppCheckoutAttempt::matchesSignedEvent($invoice, $payload)) {
                 return 'stale_attempt';
             }
-            $state = self::loadState($invoice->data()->get(self::STATE_DATA_KEY));
+            $state = self::readState($invoice);
             $receivedAt = $receivedAt === null ? time() : (int)$receivedAt;
             if ($receivedAt <= 0) {
                 throw new Am_Exception_Paysystem('Invalid IPN v2 receiver time');
@@ -714,7 +714,7 @@ final class PaymentGatewayAppIpnV2State
             }
 
             $invoice->refresh();
-            $state = self::loadState($invoice->data()->get(self::STATE_DATA_KEY));
+            $state = self::readState($invoice);
             if (!isset($state['deliveries'][$deliveryKey])) {
                 throw new Am_Exception_Paysystem('IPN v2 delivery state disappeared');
             }
@@ -728,9 +728,22 @@ final class PaymentGatewayAppIpnV2State
         }
     }
 
+    private static function readState($invoice)
+    {
+        $storage = $invoice->data();
+        $storedState = $storage->get(self::STATE_DATA_KEY);
+        if ($storedState === Am_DataFieldStorage::BLOB_VALUE) {
+            $storedState = $storage->getBlob(self::STATE_DATA_KEY);
+            if (!is_string($storedState) || $storedState === '') {
+                throw new Am_Exception_Paysystem('Invalid persisted IPN v2 state');
+            }
+        }
+        return self::loadState($storedState);
+    }
+
     private static function loadState($storedState)
     {
-        if ($storedState === null || $storedState === '') {
+        if ($storedState === null) {
             return array(
                 'formatVersion' => self::STATE_FORMAT_VERSION,
                 'highestEventVersions' => array(),
@@ -793,7 +806,7 @@ final class PaymentGatewayAppIpnV2State
         if (!is_string($encoded)) {
             throw new Am_Exception_Paysystem('Unable to encode IPN v2 state');
         }
-        $invoice->data()->set(self::STATE_DATA_KEY, $encoded);
+        $invoice->data()->setBlob(self::STATE_DATA_KEY, $encoded);
         $invoice->data()->update();
     }
 
