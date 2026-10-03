@@ -9,10 +9,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const policyPath = path.join(root, "scripts/validate-release-policy.mjs");
-const finalReceiverRevision = "4f6ca202eaf0fb535571b6aa4533392a3a7fa0b3";
+const finalReceiverRevision = "4dc7f9415d4798bd601ae75c1682400e7ea4e7e0";
 const finalReceiverDigests = {
-  "payment-gateway-app.php": "3d02679daed1591496ac8dbf0ee75bf3603fcb28fe6db2fa30392e67e183e6a3",
-  "README.md": "3772445e5dbd34f9590e7c6db25c1f9e6dac21265a729282a0245f25ccfcd0cf",
+  "payment-gateway-app.php": "e6fa7e1024cbdc69b6a424481099d6b845bd65f235bdea54de45f4257100db8e",
+  "README.md": "862d8a3dd386ef75de8b5711974774920cd1be2d0020f095216f6693e0b194db",
+  "SECURITY.md": "81c58137bd68a9631ad9055f3293867809a61f44b6825abd2396abdb53bbddc3",
 };
 
 test("release policy implementation is repository-local", () => {
@@ -76,7 +77,7 @@ test("trusted release manifest binds the protected workflow, policy, source, ver
   }
 });
 
-test("1.2.0 remains bound to its exact immutable receiver package source", () => {
+test("1.2.0 remains bound to every shipped file from the exact receiver package source", () => {
   const manifest = JSON.parse(readFileSync(path.join(root, ".github/release-policy.json"), "utf8"));
   const sourceRevision = manifest.releases["1.2.0"].sourceRevision;
   assert.equal(sourceRevision, finalReceiverRevision);
