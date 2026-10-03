@@ -10,11 +10,19 @@ class Am_Paysystem_Abstract
     public array $config = array();
     public array $errorLogs = array();
     public array $otherLogs = array();
+    private object $di;
+
+    public function __construct()
+    {
+        $this->di = (object)array('db' => new CheckoutAttemptDbStub());
+    }
 
     public function getConfig($key)
     {
         return $this->config[$key] ?? null;
     }
+
+    public function getDi(): object { return $this->di; }
 
     public function logError($message, $context = array()): void
     {
@@ -29,6 +37,14 @@ class Am_Paysystem_Abstract
     public function getReturnUrl(): string { return 'https://merchant.test/return'; }
     public function getCancelUrl(): string { return 'https://merchant.test/cancel'; }
     public function getPluginUrl($path): string { return 'https://merchant.test/' . $path; }
+}
+
+class CheckoutAttemptDbStub
+{
+    public function selectCell($query, ...$params): int
+    {
+        return 1;
+    }
 }
 
 class Am_Paysystem_Transaction_Incoming_Thanks {}
@@ -57,6 +73,15 @@ class Am_Paysystem_Action_Redirect
 }
 
 class Am_Exception_FatalError extends Exception {}
+
+class CheckoutAttemptDataStub
+{
+    public array $values = array();
+    public int $updates = 0;
+    public function get($key) { return $this->values[$key] ?? null; }
+    public function set($key, $value): void { $this->values[$key] = $value; }
+    public function update(): void { $this->updates++; }
+}
 
 require dirname(__DIR__) . '/payment-gateway-app.php';
 
@@ -119,8 +144,13 @@ $invoice = new class {
     public float $first_total = 10.0;
     public string $currency = 'EUR';
     public string $public_id = 'invoice-1';
+    public CheckoutAttemptDataStub $attemptData;
+    public function __construct() { $this->attemptData = new CheckoutAttemptDataStub(); }
     public function getEmail(): string { return 'customer@example.test'; }
     public function getItems(): array { return array(); }
+    public function data(): CheckoutAttemptDataStub { return $this->attemptData; }
+    public function pk(): int { return 1; }
+    public function refresh(): void {}
 };
 $result = new class {
     public $action;
@@ -129,11 +159,43 @@ $result = new class {
 };
 $plugin = new Am_Paysystem_PaymentGatewayApp();
 $plugin->config = array('api_domain' => 'api.example.test', 'site_id' => 'site-1', 'api_key' => 'secret', 'debug_logging' => 0);
-Am_HttpRequest::$response = new Am_HttpResponseStub(200, '{"paymentUrl":"https://pay.example.test/session"}');
+Am_HttpRequest::$response = new Am_HttpResponseStub(200, '{"paymentUrl":"https://pay.example.test/session","sessionPublicId":"session-public-attempt-b"}');
 $plugin->_process($invoice, null, $result);
 expectSame('https://pay.example.test/session', $result->action->url, 'Normal successful checkout must remain unchanged.');
+expectSame(
+    'session-public-attempt-b',
+    $invoice->data()->get(PaymentGatewayAppCheckoutAttempt::STATE_DATA_KEY),
+    'The checkout response attempt identity must be persisted on the invoice before redirect.'
+);
+expectSame(1, $invoice->data()->updates, 'Persisting the attempt identity must durably update invoice data once.');
 expectSame(array(), $plugin->errorLogs, 'Debug-off must not write API error logs.');
 expectSame(array(), $plugin->otherLogs, 'Debug-off must not write checkout exchange logs.');
+
+$legacyInvoice = clone $invoice;
+$legacyInvoice->attemptData = new CheckoutAttemptDataStub();
+$legacyResult = new class {
+    public $action;
+    public function setAction($action): void { $this->action = $action; }
+    public function setFailed($message): void { throw new RuntimeException($message); }
+};
+Am_HttpRequest::$response = new Am_HttpResponseStub(200, '{"paymentUrl":"https://pay.example.test/legacy"}');
+$plugin->_process($legacyInvoice, null, $legacyResult);
+expectSame('https://pay.example.test/legacy', $legacyResult->action->url, 'A gateway omitting the additive attempt identity must remain compatible.');
+expectSame(array(), $legacyInvoice->data()->values, 'An omitted attempt identity must not persist an ambiguous value.');
+
+$invalidAttemptInvoice = clone $invoice;
+$invalidAttemptInvoice->attemptData = new CheckoutAttemptDataStub();
+$invalidAttemptResult = new class {
+    public function setAction($action): void { throw new RuntimeException('Invalid attempt identity must not redirect.'); }
+    public function setFailed($message): void {
+        if ($message !== 'Payment session creation failed due to an invalid gateway response.') {
+            throw new RuntimeException('Malformed attempt identity must use fixed safe guidance.');
+        }
+    }
+};
+Am_HttpRequest::$response = new Am_HttpResponseStub(200, '{"paymentUrl":"https://pay.example.test/invalid","sessionPublicId":"invalid attempt identity"}');
+$plugin->_process($invalidAttemptInvoice, null, $invalidAttemptResult);
+expectSame(array(), $invalidAttemptInvoice->data()->values, 'A malformed checkout-attempt identity must never be persisted.');
 
 $plugin->config['debug_logging'] = 1;
 Am_HttpRequest::$response = new Am_HttpResponseStub(409, $nestedRawJson);
