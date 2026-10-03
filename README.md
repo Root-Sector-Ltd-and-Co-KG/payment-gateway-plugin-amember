@@ -86,6 +86,22 @@ of safety. History cleanup does not erase ordering or partial-effect recovery.
 Manual retries use a fresh signature over the original immutable notification.
 Never clear receiver state to force a replay.
 
+### Upgrading receiver state
+
+Back up the aMember database before installing an updated plugin. This release stores durable IPN
+v2 receiver state in aMember's native blob field so delivery history, transaction watermarks,
+effect receipts, and accepted checkout sessions are not limited by the scalar field's 255-byte
+capacity. A valid state written by the earlier scalar implementation remains readable and moves to
+blob storage on its next successful receiver update.
+
+Malformed or truncated existing state fails closed before payment, access, refund, void, or
+chargeback effects. Do not delete or edit the state record and do not downgrade the plugin after an
+invoice has accepted IPN v2. Restore the affected invoice data from a trusted database backup or
+contact your Payment Gateway App operator to reconcile the gateway delivery and aMember records.
+After reconciliation, retry the original immutable notification through the gateway so it receives
+a fresh timestamp and signature. Confirm the invoice payment/refund records and membership access
+before retrying again.
+
 The signed `ipn.test` readiness control message is **not yet supported by the
 aMember endpoint**. Payment v1/v2 receiver tests do not qualify the native
 aMember request lifecycle. Readiness must not be reported as successful until
@@ -148,7 +164,18 @@ If you suspect your Webhook Signing Secret has been compromised,
 regenerate it in Payment Gateway App admin -> Sites -> Edit and update
 the value in the aMember plugin settings.
 
+Keep the plugin and aMember installation current, serve the IPN endpoint only over trusted HTTPS,
+restrict database and aMember data-directory access to the application account, and never include
+API keys, webhook secrets, raw signed bodies, customer records, or licensed aMember files in support
+messages. See [SECURITY.md](SECURITY.md) for private vulnerability reporting guidance.
+
 ## Changelog
+
+### Unreleased
+
+- Fix: Persist durable IPN v2 receiver state through aMember's native blob storage while retaining
+  valid legacy scalar state and failing closed on truncated or corrupt records.
+- Documentation: Add upgrade, recovery, data-integrity, and private security-reporting guidance.
 
 ### 1.2.0
 
