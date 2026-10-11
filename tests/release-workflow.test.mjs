@@ -39,6 +39,18 @@ test("aMember PR validation fetches the pinned parent source", () => {
   assert.match(prWorkflow, /fetch-depth: 0/);
 });
 
+test("release validation fetches full protected-control history for approved package identity", () => {
+  const validateJob = workflow.slice(workflow.indexOf("  validate:"), workflow.indexOf("  publish:"));
+  const checkout = validateJob.match(
+    /- name: Checkout release controls\n([\s\S]*?)(?=\n\s+- name:)/,
+  );
+  assert.ok(checkout, "validate job must checkout protected release controls");
+  assert.match(checkout[0], /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(checkout[0], /fetch-depth: 0/);
+  assert.match(checkout[0], /path: release-control/);
+  assert.match(checkout[0], /persist-credentials: false/);
+});
+
 test("every action in aMember release-control workflows is pinned to a reviewed commit", () => {
   const actionLines = `${workflow}\n${prWorkflow}`.split("\n").filter((line) => /\buses:/.test(line));
   assert.ok(actionLines.length > 0);
