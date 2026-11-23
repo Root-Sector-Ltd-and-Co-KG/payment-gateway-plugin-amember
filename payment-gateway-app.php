@@ -28,17 +28,53 @@ final class PaymentGatewayAppCheckoutAmounts
         return in_array($currency, array('CLF', 'UYW'), true) ? 4 : 2;
     }
 
+    private static function decimal($value, $digits)
+    {
+        if (!is_float($value)) { return $value; }
+        // Conservative bound keeps binary spacing below one minor unit even
+        // when the decimal scale falls between powers of two. Canonical decimal
+        // strings remain supported up to PHP_INT_MAX.
+        if (!is_finite($value) || abs($value) >= 4503599627370496.0 / (10 ** $digits)) {
+            throw new InvalidArgumentException('Ambiguous checkout float amount.');
+        }
+        // Find the shortest decimal that round-trips to the legacy float.
+        // Explicit significant digits and locale-independent H avoid both PHP
+        // precision settings and the binary tail of values such as 1.005.
+        for ($precision = 1; $precision <= 17; $precision++) {
+            $decimal = sprintf('%.' . $precision . 'H', $value);
+            if ((float)$decimal === $value) { break; }
+        }
+        if (stripos($decimal, 'e') === false) { return $decimal; }
+        // Only internally formatted floats may use exponent notation. Strings
+        // supplied by callers still pass the strict plain-decimal parser.
+        list($mantissa, $exponent) = preg_split('/e/i', $decimal);
+        $negative = $mantissa[0] === '-';
+        $mantissa = ltrim($mantissa, '-');
+        $point = strpos($mantissa, '.');
+        $point = ($point === false ? strlen($mantissa) : $point) + (int)$exponent;
+        $integer = str_replace('.', '', $mantissa);
+        if ($point <= 0) {
+            $decimal = '0.' . str_repeat('0', -$point) . $integer;
+        } elseif ($point >= strlen($integer)) {
+            $decimal = $integer . str_repeat('0', $point - strlen($integer));
+        } else {
+            $decimal = substr($integer, 0, $point) . '.' . substr($integer, $point);
+        }
+        return ($negative ? '-' : '') . $decimal;
+    }
+
     public static function minorUnits($value, $currency)
     {
         return self::sumMinorUnits(array($value), $currency);
     }
 
-    public static function sumMinorUnits(array $values, $currency)
+    public static function sumMinorUnits(array $values, $currency, $rounding = 'nearest')
     {
         $digits = self::digits($currency);
         $scale = $digits;
         $parts = array();
         foreach ($values as $value) {
+            $value = self::decimal($value, $digits);
             if ((!is_string($value) && !is_int($value) && !is_float($value))
                 || !preg_match('/\A(-?)([0-9]+)(?:\.([0-9]+))?\z/', (string)$value, $part)) {
                 throw new InvalidArgumentException('Invalid checkout decimal amount.');
@@ -56,7 +92,12 @@ final class PaymentGatewayAppCheckoutAmounts
         $cut = strlen($absolute) - $scale + $digits;
         $minor = substr($absolute, 0, $cut);
         // Round once after summing decimal components, half away from zero.
-        if ($cut < strlen($absolute) && $absolute[$cut] >= '5') { $minor = self::add($minor, '1'); }
+        $fraction = substr($absolute, $cut);
+        $hasFraction = trim($fraction, '0') !== '';
+        if (($rounding === 'nearest' && $fraction !== '' && $fraction[0] >= '5')
+            || ($hasFraction && (($rounding === 'floor' && $negative) || ($rounding === 'ceil' && !$negative)))) {
+            $minor = self::add($minor, '1');
+        }
         $minor = ltrim($minor, '0');
         $minor = $minor === '' ? '0' : $minor;
         $limit = (string)PHP_INT_MAX;
@@ -112,6 +153,45 @@ final class PaymentGatewayAppCheckoutAmounts
         if ($remainder !== 0) {
             $items[] = array('description' => $description, 'quantity' => $remainder, 'unitPrice' => $unit + ($amount < 0 ? -1 : 1), 'itemType' => $type);
         }
+    }
+
+    public static function buildItems(array $lines, $amount, $currency)
+    {
+        $values = array(); $rounded = array();
+        foreach ($lines as $line) {
+            foreach ($line['values'] as $value) { $values[] = $value; }
+            $rounded[] = self::sumMinorUnits($line['values'], $currency);
+        }
+        // A genuine mismatch must never be hidden by changing a line. Only
+        // reconcile the rounding of an exact aggregate that matches the order.
+        if (self::sumMinorUnits($values, $currency) !== $amount) {
+            throw new InvalidArgumentException('Checkout items do not match the declared total.');
+        }
+        $difference = $amount - self::sumMinorUnits($rounded, 'JPY');
+        foreach ($lines as $index => $line) {
+            if ($difference === 0) { break; }
+            $step = $difference > 0 ? 1 : -1;
+            $alternative = self::sumMinorUnits($line['values'], $currency, $step > 0 ? 'ceil' : 'floor');
+            if ($alternative !== $rounded[$index]) {
+                $candidate = array();
+                try {
+                    self::appendLine($candidate, $line['description'], $line['quantity'], $alternative, $line['itemType']);
+                } catch (InvalidArgumentException $error) {
+                    continue; // Try another fractional line; never introduce a zero-priced unit.
+                }
+                // Stay within this line's floor/ceiling; exact product, fee and
+                // tax amounts are never adjusted to absorb someone else's drift.
+                $rounded[$index] = $alternative;
+                $difference -= $step;
+            }
+        }
+        if ($difference !== 0) { throw new InvalidArgumentException('Unrepresentable checkout rounding.'); }
+        $items = array();
+        foreach ($lines as $index => $line) {
+            self::appendLine($items, $line['description'], $line['quantity'], $rounded[$index], $line['itemType']);
+        }
+        self::validateTotal($items, $amount);
+        return $items;
     }
 
     public static function validateTotal(array $items, $amount)
@@ -475,19 +555,16 @@ class Am_Paysystem_PaymentGatewayApp extends Am_Paysystem_Abstract
 
             // Conditionally pass items
             if ($this->getConfig('pass_items')) {
-                $items = array();
+                $lines = array();
                 foreach ($invoice->getItems() as $item) {
-                    PaymentGatewayAppCheckoutAmounts::appendLine(
-                        $items,
-                        html_entity_decode($item->item_title, ENT_QUOTES | ENT_HTML5, 'UTF-8'),
-                        $item->qty,
-                        PaymentGatewayAppCheckoutAmounts::minorUnits($item->first_total, $currency),
-                        'digital_service'
+                    $lines[] = array(
+                        'description' => html_entity_decode($item->item_title, ENT_QUOTES | ENT_HTML5, 'UTF-8'),
+                        'quantity' => $item->qty,
+                        'values' => array($item->first_total),
+                        'itemType' => 'digital_service'
                     );
                 }
-                PaymentGatewayAppCheckoutAmounts::validateTotal($items, $amount);
-
-                $hashData['items'] = $items;
+                $hashData['items'] = PaymentGatewayAppCheckoutAmounts::buildItems($lines, $amount, $currency);
             }
 
         } catch (InvalidArgumentException $error) {

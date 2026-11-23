@@ -233,7 +233,7 @@ echo "aMember customer risk hold contract: PASS\n";
 
 class AmountTestInvoice
 {
-    public string $first_total = '10.00';
+    public $first_total = '10.00';
     public string $currency = 'EUR';
     public string $public_id = 'amount-invoice';
     public array $items = array();
@@ -279,3 +279,51 @@ foreach (array('1e3', 'NaN', '1,00', '', '92233720368547758.08') as $invalid) {
     try { PaymentGatewayAppCheckoutAmounts::minorUnits($invalid, 'EUR'); } catch (InvalidArgumentException $error) { $rejected = true; }
     expectTrue($rejected, 'Invalid or overflowing amount must be rejected.');
 }
+
+$oldPrecision = ini_get('precision'); $oldSerializePrecision = ini_get('serialize_precision');
+try {
+    foreach (array(array('14', '14'), array('6', '3'), array('17', '-1')) as [$precision, $serializePrecision]) {
+        ini_set('precision', $precision); ini_set('serialize_precision', $serializePrecision);
+        foreach (array(array(123456789012.345, 'KWD', 123456789012345), array(1.005, 'EUR', 101), array(-1.005, 'EUR', -101), array(1.0e-7, 'EUR', 0), array(1.0e12, 'JPY', 1000000000000)) as [$value, $currency, $expected]) {
+            expectSame($expected, PaymentGatewayAppCheckoutAmounts::minorUnits($value, $currency), 'Legacy floats must not depend on ini precision.');
+        }
+        $invoice = new AmountTestInvoice(); $invoice->currency = 'KWD'; $invoice->first_total = 123456789012.345;
+        $plugin->config['pass_items'] = false;
+        $plugin->_process($invoice, null, $result);
+        $payload = end(Am_HttpRequest::$bodies);
+        expectSame(123456789012345, $payload['amount'], 'Production checkout must preserve legacy float without item forwarding.');
+        expectTrue(!isset($payload['items']), 'Disabled item forwarding must remain disabled.');
+    }
+} finally {
+    ini_set('precision', $oldPrecision); ini_set('serialize_precision', $oldSerializePrecision);
+}
+foreach (array(INF, -INF, NAN, 1.0e20, 9007199254740992.0, '1e3') as $invalid) {
+    $rejected = false;
+    try { PaymentGatewayAppCheckoutAmounts::minorUnits($invalid, 'JPY'); } catch (InvalidArgumentException $error) { $rejected = true; }
+    expectTrue($rejected, 'Non-finite, ambiguous or exponent-string values must fail safely.');
+}
+
+$plugin->config['pass_items'] = true;
+foreach (array(array('1.004', '2.004', '3.01', 301), array('1.006', '2.006', '3.01', 301)) as [$first, $second, $total, $minor]) {
+    $invoice = new AmountTestInvoice(); $invoice->first_total = $total;
+    $invoice->items = array((object)array('first_total' => $first, 'qty' => 1, 'item_title' => 'First'), (object)array('first_total' => $second, 'qty' => 2, 'item_title' => 'Second'));
+    $plugin->_process($invoice, null, $result); $payload = end(Am_HttpRequest::$bodies);
+    $sum = 0; foreach ($payload['items'] as $item) { $sum += $item['quantity'] * $item['unitPrice']; }
+    expectSame($minor, $sum, 'Only aggregate rounding drift must be reconciled.');
+    expectSame(3, array_sum(array_column($payload['items'], 'quantity')), 'Reconciliation must preserve quantity.');
+}
+
+$roundedItems = PaymentGatewayAppCheckoutAmounts::buildItems(array(
+    array('description' => 'Small', 'quantity' => 1, 'values' => array('0.005'), 'itemType' => 'goods'),
+    array('description' => 'Adjustable', 'quantity' => 1, 'values' => array('1.005'), 'itemType' => 'goods'),
+    array('description' => 'Exact tax', 'quantity' => 1, 'values' => array('0.20'), 'itemType' => 'tax'),
+), 121, 'EUR');
+expectSame(array(1, 100, 20), array_column($roundedItems, 'unitPrice'), 'Reconciliation must skip zero-price alternatives and preserve exact tax.');
+
+// Near 9e12 KWD, binary64 spacing exceeds 0.001 KWD; reject the
+// legacy float rather than pretending it identifies an adjacent minor unit.
+$ambiguousKwdRejected = false;
+try { PaymentGatewayAppCheckoutAmounts::minorUnits(9000000000000.001, 'KWD'); }
+catch (InvalidArgumentException $error) { $ambiguousKwdRejected = true; }
+expectTrue($ambiguousKwdRejected, 'Adjacent KWD minor units must remain distinguishable for legacy floats.');
+expectSame(9000000000000001, PaymentGatewayAppCheckoutAmounts::minorUnits('9000000000000.001', 'KWD'), 'Canonical decimal strings must retain full minor-unit precision.');
