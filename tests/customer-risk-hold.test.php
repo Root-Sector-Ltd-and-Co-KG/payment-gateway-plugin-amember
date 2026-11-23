@@ -327,3 +327,21 @@ try { PaymentGatewayAppCheckoutAmounts::minorUnits(9000000000000.001, 'KWD'); }
 catch (InvalidArgumentException $error) { $ambiguousKwdRejected = true; }
 expectTrue($ambiguousKwdRejected, 'Adjacent KWD minor units must remain distinguishable for legacy floats.');
 expectSame(9000000000000001, PaymentGatewayAppCheckoutAmounts::minorUnits('9000000000000.001', 'KWD'), 'Canonical decimal strings must retain full minor-unit precision.');
+
+foreach (array(array('1.004', '2.004', '3.00', array(100, 200)), array('0.004', '1.006', '1.01', array(1, 100))) as [$first, $second, $total, $prices]) {
+    $invoice = new AmountTestInvoice(); $invoice->first_total = $total;
+    $invoice->items = array((object)array('first_total' => $first, 'qty' => 1, 'item_title' => 'First'), (object)array('first_total' => $second, 'qty' => 1, 'item_title' => 'Second'));
+    $before = count(Am_HttpRequest::$bodies);
+    $plugin->_process($invoice, null, $result); $payload = end(Am_HttpRequest::$bodies);
+    expectSame($before + 1, count(Am_HttpRequest::$bodies), 'Feasible line rounding must create a checkout.');
+    expectSame($prices, array_column($payload['items'], 'unitPrice'), 'Preserve balanced lines or choose valid floor/ceil prices.');
+    expectSame(array(1, 1), array_column($payload['items'], 'quantity'), 'Do not invent items or change quantities.');
+}
+$zeroRejected = false;
+try {
+    PaymentGatewayAppCheckoutAmounts::buildItems(array(
+        array('description' => 'Zero', 'quantity' => 1, 'values' => array('0'), 'itemType' => 'goods'),
+        array('description' => 'Paid', 'quantity' => 1, 'values' => array('1.01'), 'itemType' => 'goods'),
+    ), 101, 'EUR');
+} catch (InvalidArgumentException $error) { $zeroRejected = true; }
+expectTrue($zeroRejected, 'A true zero line has no valid positive floor/ceil and must still fail.');
