@@ -63,7 +63,8 @@ class Am_HttpRequest
     public static Am_HttpResponseStub $response;
     public function __construct($url, $method) {}
     public function setHeader($name, $value): void {}
-    public function setBody($body): void {}
+    public static array $bodies = array();
+    public function setBody($body): void { self::$bodies[] = json_decode($body, true); }
     public function send(): Am_HttpResponseStub { return self::$response; }
 }
 
@@ -229,3 +230,52 @@ try {
 }
 
 echo "aMember customer risk hold contract: PASS\n";
+
+class AmountTestInvoice
+{
+    public string $first_total = '10.00';
+    public string $currency = 'EUR';
+    public string $public_id = 'amount-invoice';
+    public array $items = array();
+    public function getEmail() { return 'buyer@example.test'; }
+    public function getItems() { return $this->items; }
+}
+$plugin->config['pass_items'] = true;
+Am_HttpRequest::$response = new Am_HttpResponseStub(200, '{"paymentUrl":"https://pay.example.test/session"}');
+foreach (array(array('JPY', '1000', 1000), array('EUR', '10.00', 1000), array('KWD', '1.234', 1234)) as [$currency, $major, $minor]) {
+    $invoice = new AmountTestInvoice(); $invoice->currency = $currency; $invoice->first_total = $major;
+    $invoice->items = array((object)array('first_total' => $major, 'qty' => 3, 'item_title' => 'Product &amp; Service'));
+    $plugin->_process($invoice, null, $result);
+    $payload = end(Am_HttpRequest::$bodies);
+    expectSame($minor, $payload['amount'], 'Invoice must use currency minor units.');
+    expectSame($currency, $payload['currency'], 'Invoice currency must be retained.');
+    expectSame(3, array_sum(array_column($payload['items'], 'quantity')), 'Price split must preserve total quantity.');
+    $sum = 0; foreach ($payload['items'] as $item) { $sum += $item['quantity'] * $item['unitPrice']; expectSame('digital_service', $item['itemType'], 'aMember item type must be retained.'); expectSame('Product & Service', $item['description'], 'aMember description decoding must be retained.'); }
+    expectSame($minor, $sum, 'Item sum must equal declared amount.');
+    if ($currency === 'EUR') { expectSame(array(333, 334), array_column($payload['items'], 'unitPrice'), 'EUR 10 / 3 requires two distinct integer unit prices.'); }
+}
+foreach (array(array('0.01', 3, '0.01'), array('9.00', 1, '10.00')) as [$line, $quantity, $total]) {
+    $invoice = new AmountTestInvoice(); $invoice->first_total = $total;
+    $invoice->items = array((object)array('first_total' => $line, 'qty' => $quantity, 'item_title' => 'Product'));
+    $before = count(Am_HttpRequest::$bodies);
+    $failed = new class { public bool $failed = false; public function setFailed($message) { $this->failed = true; } public function setAction($action) { throw new RuntimeException('Must not redirect invalid amounts'); } };
+    $plugin->_process($invoice, null, $failed);
+    expectTrue($failed->failed, 'Inconsistent or unrepresentable amounts must fail visibly.');
+    expectSame($before, count(Am_HttpRequest::$bodies), 'Invalid amounts must never reach the gateway.');
+}
+echo "aMember checkout amount contract: PASS\n";
+
+foreach (array(
+    array('JPY', '1000', 1000), array('EUR', '0.29', 29), array('KWD', '1.234', 1234),
+    array('CLF', '1.2345', 12345), array('eur', '1.005', 101), array('EUR', '-1.005', -101),
+    array('EUR', '90071992547409.91', 9007199254740991), array('EUR', '92233720368547758.07', PHP_INT_MAX),
+) as [$currency, $value, $expected]) {
+    expectSame($expected, PaymentGatewayAppCheckoutAmounts::minorUnits($value, $currency), 'Exact decimal conversion: ' . $value);
+}
+expectSame(1, PaymentGatewayAppCheckoutAmounts::sumMinorUnits(array('0.004', '0.004'), 'EUR'), 'Gross is rounded only after exact summation.');
+expectSame(-125, PaymentGatewayAppCheckoutAmounts::sumMinorUnits(array('0.25', '-1.50'), 'EUR'), 'Mixed-sign summation must preserve discounts.');
+foreach (array('1e3', 'NaN', '1,00', '', '92233720368547758.08') as $invalid) {
+    $rejected = false;
+    try { PaymentGatewayAppCheckoutAmounts::minorUnits($invalid, 'EUR'); } catch (InvalidArgumentException $error) { $rejected = true; }
+    expectTrue($rejected, 'Invalid or overflowing amount must be rejected.');
+}
