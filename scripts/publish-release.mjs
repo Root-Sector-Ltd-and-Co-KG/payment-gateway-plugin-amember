@@ -1,365 +1,63 @@
 #!/usr/bin/env node
 
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-function sha256(body) {
-  return `sha256:${createHash("sha256").update(body).digest("hex")}`;
-}
+// Public source: Root-Sector-Ltd-and-Co-KG/payment-gateway-plugin-woocommerce
+// Revision: e19da7c7086df7edf538f0a9dc0225de5e0cf8c9. Changes require review
+// of both hashes and the pinned checkouts; this wrapper is release-digest bound.
+const files = Object.freeze({
+  "scripts/publish-release.mjs": "45820072374c6a7641c12eb6fdc45d2f58a4c4fec5ef16536345672f022187e1",
+  "tests/publish-release.test.mjs": "5fa161b1808139d8b204ddca6465aa2f7a1f1e22971a09ba1995bf91eab59a32",
+});
 
-function requireFullRevision(value, label) {
-  if (!/^[0-9a-f]{40}$/.test(String(value || ""))) {
-    throw new Error(`${label} must be a full lowercase commit SHA`);
-  }
-  return value;
-}
-
-function localAssets(assets) {
-  if (!Array.isArray(assets) || assets.length !== 3) {
-    throw new Error("Publication requires exactly three release assets");
-  }
-  const names = new Set();
-  return assets.map((asset) => {
-    if (!asset?.name || !asset?.path || names.has(asset.name)) {
-      throw new Error("Publication asset names and paths must be unique");
+export function withVerifiedPublisher(sourceRoot, execute) {
+  if (!sourceRoot) throw new Error("SHARED_PUBLISHER_ROOT is required");
+  const verified = Object.entries(files).map(([relative, expected]) => {
+    let body;
+    try {
+      body = fs.readFileSync(path.join(sourceRoot, relative));
+    } catch (error) {
+      if (error.code === "ENOENT") throw new Error(`Missing shared publisher file: ${relative}`);
+      throw error;
     }
-    names.add(asset.name);
-    const body = fs.readFileSync(asset.path);
-    return { ...asset, body, digest: sha256(body) };
+    if (createHash("sha256").update(body).digest("hex") !== expected) {
+      throw new Error(`Shared publisher digest mismatch: ${relative}`);
+    }
+    return [relative, body];
   });
-}
-
-async function validateRemoteAsset(github, remote, local) {
-  if (remote.digest !== local.digest) {
-    throw new Error(`Existing asset ${remote.name} does not match the validated local digest`);
-  }
-  const downloaded = await github.downloadAsset(remote);
-  if (!Buffer.from(downloaded).equals(local.body)) {
-    throw new Error(`Existing asset ${remote.name} does not match the validated local content`);
-  }
-}
-
-function indexAssets(release, expectedNames) {
-  const indexed = new Map();
-  for (const asset of release.assets || []) {
-    if (!expectedNames.has(asset.name)) {
-      throw new Error(`Draft release contains unexpected asset ${asset.name}`);
-    }
-    if (indexed.has(asset.name)) {
-      throw new Error(`Draft release contains duplicate asset ${asset.name}`);
-    }
-    indexed.set(asset.name, asset);
-  }
-  return indexed;
-}
-
-function validateReleaseMetadata(release, expected, label) {
-  if (
-    !release
-    || release.tagName !== expected.version
-    || release.title !== expected.title
-    || release.body !== expected.notes
-    || release.prerelease !== false
-    || release.draft !== expected.draft
-  ) {
-    throw new Error(`${label} release metadata does not match the validated publication`);
-  }
-}
-
-async function validateExactAssets(github, release, expected, expectedNames) {
-  const indexed = indexAssets(release, expectedNames);
-  if (indexed.size !== expected.length) {
-    throw new Error(`Release ${release.tagName} does not contain all expected assets`);
-  }
-  for (const local of expected) {
-    await validateRemoteAsset(github, indexed.get(local.name), local);
-  }
-  return indexed;
-}
-
-export async function publishPluginRelease({
-  repository,
-  version,
-  sourceRevision,
-  title,
-  notes,
-  assets,
-  github,
-}) {
-  requireFullRevision(sourceRevision, "source revision");
-  if (!/^\d+\.\d+\.\d+$/.test(String(version || ""))) {
-    throw new Error("release version must use x.y.z SemVer");
-  }
-  const expected = localAssets(assets);
-  const expectedNames = new Set(expected.map(({ name }) => name));
-
-  const tagTarget = await github.resolveTag(version);
-  if (tagTarget === null) {
-    await github.createTag(version, sourceRevision);
-  } else if (tagTarget !== sourceRevision) {
-    throw new Error(`Existing tag ${version} targets ${tagTarget} instead of ${sourceRevision}`);
-  }
-
-  let release = await github.getRelease(version);
-  if (release && release.draft !== true) {
-    throw new Error(`Published release ${version} is immutable and must be refused`);
-  }
-  if (!release) {
-    await github.createDraftRelease({ tagName: version, title, notes });
-    release = await github.getRelease(version);
-  }
-  validateReleaseMetadata(release, { version, title, notes, draft: true }, "Draft");
-
-  let indexed = indexAssets(release, expectedNames);
-  for (const local of expected) {
-    const remote = indexed.get(local.name);
-    if (remote) await validateRemoteAsset(github, remote, local);
-  }
-
-  for (const local of expected) {
-    if (!indexed.has(local.name)) {
-      await github.uploadAsset({
-        tagName: version,
-        name: local.name,
-        path: local.path,
-      });
-    }
-  }
-
-  release = await github.getRelease(version);
-  validateReleaseMetadata(release, { version, title, notes, draft: true }, "Draft");
-  await validateExactAssets(github, release, expected, expectedNames);
-
-  const published = await github.publishRelease(release.id, { title, notes });
-  validateReleaseMetadata(published, { version, title, notes, draft: false }, "Published");
-
-  const finalRelease = await github.getRelease(version);
-  validateReleaseMetadata(finalRelease, { version, title, notes, draft: false }, "Final");
-  await validateExactAssets(github, finalRelease, expected, expectedNames);
-}
-
-function ghFailureIs404(error) {
-  const statuses = [...String(error?.stderr || error?.message || "").matchAll(/\bHTTP\s+(\d{3})\b/gi)];
-  return statuses.length === 1 && statuses[0][1] === "404";
-}
-
-function ghJson(args, { input, allow404 = false, executable = "gh" } = {}) {
-  let output;
+  // Execute only this private snapshot: no unverified checkout files, package
+  // configuration, or later checkout modifications can enter module resolution.
+  // Canonicalize macOS temporary-directory symlinks for the shared CLI entry guard.
+  const snapshot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "verified-plugin-publisher-")));
   try {
-    output = execFileSync(executable, args, {
-      encoding: "utf8",
-      input,
-      stdio: ["pipe", "pipe", "pipe"],
+    for (const [relative, body] of verified) {
+      const target = path.join(snapshot, relative);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, body, { mode: 0o600 });
+    }
+    return execute(snapshot);
+  } finally {
+    fs.rmSync(snapshot, { recursive: true, force: true });
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    process.exitCode = withVerifiedPublisher(process.env.SHARED_PUBLISHER_ROOT, (snapshot) => {
+      const result = spawnSync(process.execPath, [path.join(snapshot, "scripts/publish-release.mjs"), ...process.argv.slice(2)], {
+        stdio: "inherit",
+      });
+      if (result.error) throw result.error;
+      if (result.status === null) throw new Error("Shared publisher terminated without an exit status");
+      return result.status;
     });
   } catch (error) {
-    if (allow404 && ghFailureIs404(error)) return null;
-    throw error;
-  }
-  const body = output.trim();
-  if (!body) throw new Error("GitHub API returned an empty response");
-  const parsed = JSON.parse(body);
-  if (!parsed) throw new Error("GitHub API returned a falsey JSON response");
-  return parsed;
-}
-
-function mapRelease(release) {
-  if (!release) return null;
-  return {
-    id: release.id,
-    tagName: release.tag_name,
-    title: release.name,
-    body: release.body,
-    draft: release.draft,
-    prerelease: release.prerelease,
-    assets: (release.assets || []).map((asset) => ({
-      id: asset.id,
-      name: asset.name,
-      digest: asset.digest,
-    })),
-  };
-}
-
-export function createGitHubClient(repository, executable = "gh") {
-  const api = (args, options = {}) => ghJson(args, { ...options, executable });
-  return {
-    async resolveTag(version) {
-      let reference = api(
-        ["api", "--method", "GET", `repos/${repository}/git/ref/tags/${encodeURIComponent(version)}`],
-        { allow404: true },
-      );
-      if (!reference) return null;
-      let object = reference.object;
-      for (let depth = 0; depth < 2 && object?.type === "tag"; depth += 1) {
-        object = api([
-          "api",
-          "--method",
-          "GET",
-          `repos/${repository}/git/tags/${object.sha}`,
-        ]).object;
-      }
-      return requireFullRevision(object?.sha, "resolved tag target");
-    },
-    async createTag(version, sourceRevision) {
-      api(
-        ["api", "--method", "POST", `repos/${repository}/git/refs`, "--input", "-"],
-        {
-          input: JSON.stringify({
-            ref: `refs/tags/${version}`,
-            sha: sourceRevision,
-          }),
-        },
-      );
-    },
-    async getRelease(version) {
-      const published = api(
-        ["api", "--method", "GET", `repos/${repository}/releases/tags/${encodeURIComponent(version)}`],
-        { allow404: true },
-      );
-      if (published) return mapRelease(published);
-
-      const pages = api([
-        "api",
-        "--method",
-        "GET",
-        "--paginate",
-        "--slurp",
-        `repos/${repository}/releases?per_page=100`,
-      ]);
-      if (!Array.isArray(pages) || !pages.every(Array.isArray)) {
-        throw new Error("Paginated release listing returned an unexpected response");
-      }
-      const matches = pages.flat().filter((release) => release?.tag_name === version);
-      if (matches.length > 1) {
-        throw new Error(`Multiple releases have the exact tag ${version}`);
-      }
-      return mapRelease(matches[0] || null);
-    },
-    async createDraftRelease({ tagName, title, notes }) {
-      return api(
-        ["api", "--method", "POST", `repos/${repository}/releases`, "--input", "-"],
-        {
-          input: JSON.stringify({
-            tag_name: tagName,
-            name: title,
-            body: notes,
-            draft: true,
-            prerelease: false,
-          }),
-        },
-      );
-    },
-    async uploadAsset({ tagName, name, path: filePath }) {
-      execFileSync(
-        executable,
-        ["release", "upload", tagName, `${filePath}#${name}`, "--repo", repository],
-        { stdio: ["ignore", "pipe", "pipe"] },
-      );
-    },
-    async downloadAsset(asset) {
-      return execFileSync(
-        executable,
-        [
-          "api",
-          "--method",
-          "GET",
-          "-H",
-          "Accept: application/octet-stream",
-          `repos/${repository}/releases/assets/${asset.id}`,
-        ],
-        { stdio: ["ignore", "pipe", "pipe"] },
-      );
-    },
-    async publishRelease(releaseId, { title, notes }) {
-      return mapRelease(api(
-        ["api", "--method", "PATCH", `repos/${repository}/releases/${releaseId}`, "--input", "-"],
-        {
-          input: JSON.stringify({
-            name: title,
-            body: notes,
-            draft: false,
-            prerelease: false,
-          }),
-        },
-      ));
-    },
-  };
-}
-
-function parseArgs(argv) {
-  const args = {};
-  for (let index = 0; index < argv.length; index += 2) {
-    const name = argv[index]?.replace(/^--/, "").replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
-    const value = argv[index + 1];
-    if (!name || value === undefined) throw new Error("Invalid publication arguments");
-    args[name] = value;
-  }
-  return args;
-}
-
-function validateBundle(args) {
-  if (args.validationJobResult !== "success") {
-    throw new Error("Publication requires a successful validation job");
-  }
-  const manifest = JSON.parse(fs.readFileSync(args.releaseManifest, "utf8"));
-  const release = manifest.releases?.[args.version];
-  if (
-    manifest.schemaVersion !== 1
-    || manifest.defaultBranch !== "main"
-    || release?.sourceRevision !== args.sourceSha
-    || release?.artifactName !== path.basename(args.artifact)
-    || `${release.artifactName}.sha256` !== path.basename(args.checksum)
-    || path.basename(args.validation) !== "plugin-release-validation.json"
-  ) {
-    throw new Error("Publication bundle does not match the trusted release manifest");
-  }
-  const artifactBody = fs.readFileSync(args.artifact);
-  const artifactHash = sha256(artifactBody).slice("sha256:".length);
-  const checksum = fs.readFileSync(args.checksum, "utf8");
-  if (checksum !== `${artifactHash}  ${release.artifactName}\n`) {
-    throw new Error("Publication checksum does not bind the exact release artifact");
-  }
-  const evidence = JSON.parse(fs.readFileSync(args.validation, "utf8"));
-  if (
-    evidence.validated !== true
-    || evidence.sourceRevision !== args.sourceSha
-    || evidence.version !== args.version
-    || evidence.policy?.id !== manifest.policy?.id
-    || evidence.policy?.revision !== args.policyRevision
-    || evidence.workflowPath !== manifest.workflowPath
-    || evidence.artifactName !== release.artifactName
-    || evidence.artifactSha256 !== artifactHash
-    || evidence.checksumAssetName !== `${release.artifactName}.sha256`
-    || evidence.validationJobResult !== "success"
-  ) {
-    throw new Error("Publication validation evidence does not match the trusted release bundle");
-  }
-  return release;
-}
-
-async function runCli(argv) {
-  const args = parseArgs(argv);
-  const release = validateBundle(args);
-  await publishPluginRelease({
-    repository: args.repository,
-    version: args.version,
-    sourceRevision: args.sourceSha,
-    title: args.title,
-    notes: fs.readFileSync(args.notes, "utf8"),
-    assets: [
-      { name: release.artifactName, path: args.artifact },
-      { name: `${release.artifactName}.sha256`, path: args.checksum },
-      { name: "plugin-release-validation.json", path: args.validation },
-    ],
-    github: createGitHubClient(args.repository),
-  });
-}
-
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  runCli(process.argv.slice(2)).catch((error) => {
     console.error(`ERROR: ${error.message}`);
-    process.exit(1);
-  });
+    process.exitCode = 1;
+  }
 }

@@ -12,6 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  SHARED_PUBLISHER_ROOT: ${{ github.workspace }}/shared-plugin-publisher
   SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
   PLUGIN_RELEASE_VERSION: ${{ github.event.client_payload.version }}
   RELEASE_POLICY_REVISION: ${{ github.sha }}
@@ -83,6 +84,14 @@ jobs:
           php tests/plugin-load.test.php
           php tests/ipn-v2.test.php
 
+      - name: Checkout pinned public publisher
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: Root-Sector-Ltd-and-Co-KG/payment-gateway-plugin-woocommerce
+          ref: e19da7c7086df7edf538f0a9dc0225de5e0cf8c9
+          path: shared-plugin-publisher
+          persist-credentials: false
+
       - name: Validate release-control regressions
         run: |
           php release-control/tests/release-workflow.test.php
@@ -147,6 +156,14 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: release-control
+          persist-credentials: false
+
+      - name: Checkout pinned public publisher
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: Root-Sector-Ltd-and-Co-KG/payment-gateway-plugin-woocommerce
+          ref: e19da7c7086df7edf538f0a9dc0225de5e0cf8c9
+          path: shared-plugin-publisher
           persist-credentials: false
 
       - name: Download validated release bundle

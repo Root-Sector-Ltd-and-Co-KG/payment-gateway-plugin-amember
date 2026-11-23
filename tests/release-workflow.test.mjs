@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -94,4 +96,49 @@ test("publication resumes a verified draft and publishes only after exact asset 
   assert.match(workflow, /draft/i);
   assert.match(workflow, /release-bundle/);
   assert.doesNotMatch(workflow, /allowUpdates|--clobber|release-action|zip-release/);
+});
+
+
+test("shared publisher is checked out at one immutable public revision in every executing job", () => {
+  for (const job of [
+    workflow.slice(workflow.indexOf("  validate:"), workflow.indexOf("  publish:")),
+    workflow.slice(workflow.indexOf("  publish:")),
+    prWorkflow,
+  ]) {
+    const checkout = job.match(/- name: Checkout pinned public publisher\n([\s\S]*?)(?=\n\s+- name:)/);
+    assert.ok(checkout, "every executing job must fetch the shared public source");
+    assert.match(checkout[0], /repository: Root-Sector-Ltd-and-Co-KG\/payment-gateway-plugin-woocommerce/);
+    assert.match(checkout[0], /ref: e19da7c7086df7edf538f0a9dc0225de5e0cf8c9/);
+    assert.match(checkout[0], /path: shared-plugin-publisher/);
+    assert.match(checkout[0], /persist-credentials: false/);
+    assert.doesNotMatch(checkout[0], /token:|ssh-key:/);
+    assert.ok(job.indexOf(checkout[0]) < job.indexOf("node "));
+  }
+  for (const source of [workflow, prWorkflow]) {
+    assert.match(source, /SHARED_PUBLISHER_ROOT: \$\{\{ github\.workspace \}\}\/shared-plugin-publisher/);
+  }
+});
+
+test("publisher wrapper refuses missing or modified shared files before invoking their code", (t) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "publisher-boundary-"));
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
+  const marker = path.join(temporary, "executed");
+  const env = { ...process.env };
+  delete env.SHARED_PUBLISHER_ROOT;
+  const run = () => spawnSync(process.execPath, [path.join(root, "scripts/publish-release.mjs")], { env, encoding: "utf8" });
+  let result = run();
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /SHARED_PUBLISHER_ROOT is required/);
+  env.SHARED_PUBLISHER_ROOT = temporary;
+  result = run();
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Missing shared publisher file/);
+  fs.mkdirSync(path.join(temporary, "scripts"));
+  fs.mkdirSync(path.join(temporary, "tests"));
+  fs.writeFileSync(path.join(temporary, "scripts/publish-release.mjs"),
+    `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, "invoked");`);
+  result = run();
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Shared publisher digest mismatch: scripts\/publish-release\.mjs/);
+  assert.equal(fs.existsSync(marker), false);
 });
