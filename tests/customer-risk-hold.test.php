@@ -63,7 +63,8 @@ class Am_HttpRequest
     public static Am_HttpResponseStub $response;
     public function __construct($url, $method) {}
     public function setHeader($name, $value): void {}
-    public function setBody($body): void {}
+    public static array $bodies = array();
+    public function setBody($body): void { self::$bodies[] = json_decode($body, true); }
     public function send(): Am_HttpResponseStub { return self::$response; }
 }
 
@@ -229,3 +230,118 @@ try {
 }
 
 echo "aMember customer risk hold contract: PASS\n";
+
+class AmountTestInvoice
+{
+    public $first_total = '10.00';
+    public string $currency = 'EUR';
+    public string $public_id = 'amount-invoice';
+    public array $items = array();
+    public function getEmail() { return 'buyer@example.test'; }
+    public function getItems() { return $this->items; }
+}
+$plugin->config['pass_items'] = true;
+Am_HttpRequest::$response = new Am_HttpResponseStub(200, '{"paymentUrl":"https://pay.example.test/session"}');
+foreach (array(array('JPY', '1000', 1000), array('EUR', '10.00', 1000), array('KWD', '1.234', 1234)) as [$currency, $major, $minor]) {
+    $invoice = new AmountTestInvoice(); $invoice->currency = $currency; $invoice->first_total = $major;
+    $invoice->items = array((object)array('first_total' => $major, 'qty' => 3, 'item_title' => 'Product &amp; Service'));
+    $plugin->_process($invoice, null, $result);
+    $payload = end(Am_HttpRequest::$bodies);
+    expectSame($minor, $payload['amount'], 'Invoice must use currency minor units.');
+    expectSame($currency, $payload['currency'], 'Invoice currency must be retained.');
+    expectSame(3, array_sum(array_column($payload['items'], 'quantity')), 'Price split must preserve total quantity.');
+    $sum = 0; foreach ($payload['items'] as $item) { $sum += $item['quantity'] * $item['unitPrice']; expectSame('digital_service', $item['itemType'], 'aMember item type must be retained.'); expectSame('Product & Service', $item['description'], 'aMember description decoding must be retained.'); }
+    expectSame($minor, $sum, 'Item sum must equal declared amount.');
+    if ($currency === 'EUR') { expectSame(array(333, 334), array_column($payload['items'], 'unitPrice'), 'EUR 10 / 3 requires two distinct integer unit prices.'); }
+}
+foreach (array(array('0.01', 3, '0.01'), array('9.00', 1, '10.00')) as [$line, $quantity, $total]) {
+    $invoice = new AmountTestInvoice(); $invoice->first_total = $total;
+    $invoice->items = array((object)array('first_total' => $line, 'qty' => $quantity, 'item_title' => 'Product'));
+    $before = count(Am_HttpRequest::$bodies);
+    $failed = new class { public bool $failed = false; public function setFailed($message) { $this->failed = true; } public function setAction($action) { throw new RuntimeException('Must not redirect invalid amounts'); } };
+    $plugin->_process($invoice, null, $failed);
+    expectTrue($failed->failed, 'Inconsistent or unrepresentable amounts must fail visibly.');
+    expectSame($before, count(Am_HttpRequest::$bodies), 'Invalid amounts must never reach the gateway.');
+}
+echo "aMember checkout amount contract: PASS\n";
+
+foreach (array(
+    array('JPY', '1000', 1000), array('EUR', '0.29', 29), array('KWD', '1.234', 1234),
+    array('CLF', '1.2345', 12345), array('eur', '1.005', 101), array('EUR', '-1.005', -101),
+    array('EUR', '90071992547409.91', 9007199254740991), array('EUR', '92233720368547758.07', PHP_INT_MAX),
+) as [$currency, $value, $expected]) {
+    expectSame($expected, PaymentGatewayAppCheckoutAmounts::minorUnits($value, $currency), 'Exact decimal conversion: ' . $value);
+}
+expectSame(1, PaymentGatewayAppCheckoutAmounts::sumMinorUnits(array('0.004', '0.004'), 'EUR'), 'Gross is rounded only after exact summation.');
+expectSame(-125, PaymentGatewayAppCheckoutAmounts::sumMinorUnits(array('0.25', '-1.50'), 'EUR'), 'Mixed-sign summation must preserve discounts.');
+foreach (array('1e3', 'NaN', '1,00', '', '92233720368547758.08') as $invalid) {
+    $rejected = false;
+    try { PaymentGatewayAppCheckoutAmounts::minorUnits($invalid, 'EUR'); } catch (InvalidArgumentException $error) { $rejected = true; }
+    expectTrue($rejected, 'Invalid or overflowing amount must be rejected.');
+}
+
+$oldPrecision = ini_get('precision'); $oldSerializePrecision = ini_get('serialize_precision');
+try {
+    foreach (array(array('14', '14'), array('6', '3'), array('17', '-1')) as [$precision, $serializePrecision]) {
+        ini_set('precision', $precision); ini_set('serialize_precision', $serializePrecision);
+        foreach (array(array(123456789012.345, 'KWD', 123456789012345), array(1.005, 'EUR', 101), array(-1.005, 'EUR', -101), array(1.0e-7, 'EUR', 0), array(1.0e12, 'JPY', 1000000000000)) as [$value, $currency, $expected]) {
+            expectSame($expected, PaymentGatewayAppCheckoutAmounts::minorUnits($value, $currency), 'Legacy floats must not depend on ini precision.');
+        }
+        $invoice = new AmountTestInvoice(); $invoice->currency = 'KWD'; $invoice->first_total = 123456789012.345;
+        $plugin->config['pass_items'] = false;
+        $plugin->_process($invoice, null, $result);
+        $payload = end(Am_HttpRequest::$bodies);
+        expectSame(123456789012345, $payload['amount'], 'Production checkout must preserve legacy float without item forwarding.');
+        expectTrue(!isset($payload['items']), 'Disabled item forwarding must remain disabled.');
+    }
+} finally {
+    ini_set('precision', $oldPrecision); ini_set('serialize_precision', $oldSerializePrecision);
+}
+foreach (array(INF, -INF, NAN, 1.0e20, 9007199254740992.0, '1e3') as $invalid) {
+    $rejected = false;
+    try { PaymentGatewayAppCheckoutAmounts::minorUnits($invalid, 'JPY'); } catch (InvalidArgumentException $error) { $rejected = true; }
+    expectTrue($rejected, 'Non-finite, ambiguous or exponent-string values must fail safely.');
+}
+
+$plugin->config['pass_items'] = true;
+foreach (array(array('1.004', '2.004', '3.01', 301), array('1.006', '2.006', '3.01', 301)) as [$first, $second, $total, $minor]) {
+    $invoice = new AmountTestInvoice(); $invoice->first_total = $total;
+    $invoice->items = array((object)array('first_total' => $first, 'qty' => 1, 'item_title' => 'First'), (object)array('first_total' => $second, 'qty' => 2, 'item_title' => 'Second'));
+    $plugin->_process($invoice, null, $result); $payload = end(Am_HttpRequest::$bodies);
+    $sum = 0; foreach ($payload['items'] as $item) { $sum += $item['quantity'] * $item['unitPrice']; }
+    expectSame($minor, $sum, 'Only aggregate rounding drift must be reconciled.');
+    expectSame(3, array_sum(array_column($payload['items'], 'quantity')), 'Reconciliation must preserve quantity.');
+}
+
+$roundedItems = PaymentGatewayAppCheckoutAmounts::buildItems(array(
+    array('description' => 'Small', 'quantity' => 1, 'values' => array('0.005'), 'itemType' => 'goods'),
+    array('description' => 'Adjustable', 'quantity' => 1, 'values' => array('1.005'), 'itemType' => 'goods'),
+    array('description' => 'Exact tax', 'quantity' => 1, 'values' => array('0.20'), 'itemType' => 'tax'),
+), 121, 'EUR');
+expectSame(array(1, 100, 20), array_column($roundedItems, 'unitPrice'), 'Reconciliation must skip zero-price alternatives and preserve exact tax.');
+
+// Near 9e12 KWD, binary64 spacing exceeds 0.001 KWD; reject the
+// legacy float rather than pretending it identifies an adjacent minor unit.
+$ambiguousKwdRejected = false;
+try { PaymentGatewayAppCheckoutAmounts::minorUnits(9000000000000.001, 'KWD'); }
+catch (InvalidArgumentException $error) { $ambiguousKwdRejected = true; }
+expectTrue($ambiguousKwdRejected, 'Adjacent KWD minor units must remain distinguishable for legacy floats.');
+expectSame(9000000000000001, PaymentGatewayAppCheckoutAmounts::minorUnits('9000000000000.001', 'KWD'), 'Canonical decimal strings must retain full minor-unit precision.');
+
+foreach (array(array('1.004', '2.004', '3.00', array(100, 200)), array('0.004', '1.006', '1.01', array(1, 100))) as [$first, $second, $total, $prices]) {
+    $invoice = new AmountTestInvoice(); $invoice->first_total = $total;
+    $invoice->items = array((object)array('first_total' => $first, 'qty' => 1, 'item_title' => 'First'), (object)array('first_total' => $second, 'qty' => 1, 'item_title' => 'Second'));
+    $before = count(Am_HttpRequest::$bodies);
+    $plugin->_process($invoice, null, $result); $payload = end(Am_HttpRequest::$bodies);
+    expectSame($before + 1, count(Am_HttpRequest::$bodies), 'Feasible line rounding must create a checkout.');
+    expectSame($prices, array_column($payload['items'], 'unitPrice'), 'Preserve balanced lines or choose valid floor/ceil prices.');
+    expectSame(array(1, 1), array_column($payload['items'], 'quantity'), 'Do not invent items or change quantities.');
+}
+$zeroRejected = false;
+try {
+    PaymentGatewayAppCheckoutAmounts::buildItems(array(
+        array('description' => 'Zero', 'quantity' => 1, 'values' => array('0'), 'itemType' => 'goods'),
+        array('description' => 'Paid', 'quantity' => 1, 'values' => array('1.01'), 'itemType' => 'goods'),
+    ), 101, 'EUR');
+} catch (InvalidArgumentException $error) { $zeroRejected = true; }
+expectTrue($zeroRejected, 'A true zero line has no valid positive floor/ceil and must still fail.');

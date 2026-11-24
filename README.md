@@ -169,6 +169,28 @@ restrict database and aMember data-directory access to the application account, 
 API keys, webhook secrets, raw signed bodies, customer records, or licensed aMember files in support
 messages. See [SECURITY.md](SECURITY.md) for private vulnerability reporting guidance.
 
+## Release-control development
+
+The publisher and its regression suite are shared with the public
+[WooCommerce plugin at revision e19da7c](https://github.com/Root-Sector-Ltd-and-Co-KG/payment-gateway-plugin-woocommerce/tree/e19da7c7086df7edf538f0a9dc0225de5e0cf8c9).
+CI checks out that immutable revision without persisted credentials. The local
+wrappers verify the exact SHA-256 of both files before executing a private copy
+of the verified bytes. Missing or changed files fail closed. The wrappers remain
+in the authenticated release-control bundle; aMember's release manifest, package
+preparation, validation receipt, and publication authorization remain local.
+
+For offline regression testing, provide a checkout containing those exact files:
+
+```sh
+SHARED_PUBLISHER_ROOT=/path/to/pinned/woocommerce-checkout node --test tests/release-policy.test.mjs tests/release-workflow.test.mjs tests/publish-release.test.mjs
+php tests/release-workflow.test.php
+```
+
+Updating the shared publisher requires reviewing its source and tests, updating
+both wrapper digests and all workflow revision pins, and obtaining the existing
+release-control approval for the resulting bundle. Historical releases and their
+approved source revisions are not rewritten.
+
 ## Changelog
 
 ### Unreleased
